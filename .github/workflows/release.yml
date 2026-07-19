@@ -83,7 +83,7 @@ jobs:
           key: security-tools-about-0.9.0-audit-0.22.2-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
       - name: Install security tools
         run: |
-          command -v cargo-about >/dev/null || cargo install --locked --version 0.9.0 cargo-about
+          command -v cargo-about >/dev/null || cargo install --locked --version 0.9.0 --features cli cargo-about
           command -v cargo-audit >/dev/null || cargo install --locked --version 0.22.2 cargo-audit
           command -v cargo-deny >/dev/null || cargo install --locked --version 0.20.2 cargo-deny
       - name: Install pinned actionlint
