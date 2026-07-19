@@ -135,10 +135,11 @@ create-dmg \
   --background assets/dmg/background.png \
   --window-pos 180 140 \
   --window-size 600 400 \
-  --icon-size 112 \
-  --icon "${APP_NAME}.app" 160 190 \
+  --text-size 12 \
+  --icon-size 88 \
+  --icon "${APP_NAME}.app" 150 200 \
   --hide-extension "${APP_NAME}.app" \
-  --app-drop-link 440 190 \
+  --app-drop-link 450 200 \
   --no-internet-enable \
   --overwrite \
   "$UNVALIDATED_DMG" "$STAGING"
