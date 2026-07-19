@@ -50,13 +50,45 @@ pwsh -NoLogo -NoProfile -NonInteractive -Command '
 ./scripts/check-live-manifests.py --self-test
 
 python3 - <<'PY'
+import json
 import plistlib
 import re
 import struct
+import tomllib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 root = Path.cwd()
+
+release_config = json.loads((root / "release-please-config.json").read_text())
+release_manifest = json.loads(
+    (root / ".release-please-manifest.json").read_text()
+)
+release_package = release_config["packages"]["."]
+assert release_config["bootstrap-sha"] == (
+    "3b44f02cf41dcce67f2918852c0047e796a4e1eb"
+)
+assert release_package["release-type"] == "rust"
+assert release_package["initial-version"] == "0.1.0"
+assert release_package["draft"] is True
+assert release_package["force-tag-creation"] is True
+assert release_package["include-component-in-tag"] is False
+assert release_package["include-v-in-tag"] is True
+assert release_manifest == {".": "0.0.0"} or release_manifest == {
+    ".": tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
+}
+
+release_please_workflow = (
+    root / ".github/workflows/release-please.yml"
+).read_text()
+assert "secrets.TAP_TOKEN" in release_please_workflow
+assert "--auto" not in release_please_workflow
+assert "pull_request_target" not in release_please_workflow
+
+release_workflow = (root / ".github/workflows/release.yml").read_text()
+assert 'gh release upload "$GITHUB_REF_NAME"' in release_workflow
+assert 'gh release edit "$GITHUB_REF_NAME"' in release_workflow
+assert "--draft=false" in release_workflow
 
 macos_pipeline = (root / "src/pipeline/macos.rs").read_text()
 runtime_requirement = re.search(

@@ -388,12 +388,30 @@ jobs:
             echo
             cat "$RUNNER_TEMP/generated-notes.md"
           } > "$RUNNER_TEMP/release-notes.md"
-      - name: Create GitHub release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME" release-assets/*
-          --repo "$GITHUB_REPOSITORY"
-          --verify-tag
-          --notes-file "$RUNNER_TEMP/release-notes.md"
-          --title "SnapDog OS Installer ${{ needs.validate-tag.outputs.version }}"
+        run: |
+          set -euo pipefail
+          title="SnapDog OS Installer ${{ needs.validate-tag.outputs.version }}"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Release Please creates a draft release and force-creates its tag so
+            # this packaging workflow can run. Keep it private until every asset
+            # and attestation has passed, then publish it as the final operation.
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --title "$title" \
+              --verify-tag
+          else
+            # Preserve the documented manual-tag recovery path.
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --title "$title"
+          fi

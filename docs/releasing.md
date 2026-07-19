@@ -1,8 +1,20 @@
 # Release configuration
 
-Releases are tag-driven. Set the desired semver in `Cargo.toml`, merge it to `main`, and push the
-exact matching tag (`v<version>`). A mismatched tag, or a tag whose commit is not contained in
-`origin/main`, fails before package jobs start.
+Release Please watches conventional commits on `main` and maintains one release pull request. That
+pull request updates `Cargo.toml`, `Cargo.lock`, `.release-please-manifest.json`, and `CHANGELOG.md`.
+It is deliberately never auto-merged: merge it only after the disposable-media checklist and the
+public manifest preflight are ready for the proposed version.
+
+Merging the release pull request creates an exact `v<version>` tag and a private draft GitHub
+release. The tag starts the package workflow; the draft is published only after all five packages,
+checksums, attestations, signing, and notarization succeed. A mismatched tag, or a tag whose commit
+is not contained in `origin/main`, fails before package jobs start. Manually pushing an exact tag
+remains a recovery path and creates the release if no Release Please draft exists.
+
+`TAP_TOKEN` is a repository Actions secret containing a GitHub token with access to this repository
+and permission to create pull requests, tags, and releases. A separate token is required because
+events created with the workflow's built-in `GITHUB_TOKEN` do not start subsequent workflows. The
+Release Please action is commit-pinned, and its token is not exposed to build or packaging jobs.
 
 The same gate fetches both public SnapDog OS channel manifests and requires schema v2 metadata for
 all four supported boards: immutable versioned HTTPS URLs, compressed and raw sizes, and both

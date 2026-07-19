@@ -72,10 +72,12 @@ packages must be built from an MSVC developer shell.
 
 ## Releasing
 
-The package version in `Cargo.toml` is authoritative. Pushing an exact matching tag such as `v0.1.0`
-builds all five packages, signs and notarizes macOS, optionally signs Windows through GitHub OIDC,
-checks the complete asset set, creates checksums and attestations, and publishes one GitHub release.
-See [Release configuration](docs/releasing.md).
+Release Please maintains the package version, `Cargo.lock`, and `CHANGELOG.md` in a release pull
+request. The release PR is deliberately never auto-merged. Merging it creates a matching `vX.Y.Z`
+tag and a private draft release; the tag builds all five packages, signs and notarizes macOS,
+optionally signs Windows through GitHub OIDC, checks the complete asset set, creates checksums and
+attestations, and publishes the release only after every gate succeeds. See
+[Release configuration](docs/releasing.md).
 
 ## License
 
