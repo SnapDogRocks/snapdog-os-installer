@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    LazyLock,
+    mpsc::{self, Receiver},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +15,8 @@ use crate::drives;
 use crate::flash::{FlashProgress, FlashStage};
 use crate::model::{Board, Channel, Drive, ImageSelection, Manifest};
 use crate::pipeline::{
-    PipelineControl, PipelineError, PipelineEvent, PipelineReport, PipelineRequest, run_pipeline,
+    PipelineControl, PipelineError, PipelineEvent, PipelineReport, PipelineRequest,
+    WorkerRunnerError, run_pipeline,
 };
 use crate::worker::{WorkerDrive, WorkerPhase, WorkerProgress};
 
@@ -30,13 +34,57 @@ const ORANGE: Color32 = Color32::from_rgb(225, 136, 46);
 const BRIGHT_ORANGE: Color32 = Color32::from_rgb(255, 159, 10);
 const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
-const MUTED: Color32 = Color32::from_rgb(148, 144, 140);
+const MUTED: Color32 = Color32::from_rgb(170, 166, 162);
+const SUBTLE: Color32 = Color32::from_rgb(118, 114, 111);
 const DANGER: Color32 = Color32::from_rgb(255, 105, 97);
+const VERSION_CONTROL_WIDTH: f32 = 220.0;
+const WORKFLOW_CONNECTOR_WIDTH: f32 = 62.0;
+const STEP_ICON_CENTER_Y: f32 = 151.0;
+const BOARD_GRID_WIDTH: f32 = 302.0;
+const BOARD_GRID_HEIGHT: f32 = 274.0;
+const WORKFLOW_OPTICAL_LEFT_SHIFT: f32 = 15.0;
+// assets/snapdog-logo.svg has a square 595.3 × 595.3 viewBox.
+const SNAPDOG_LOGO_ASPECT_RATIO: f32 = 1.0;
 const THIRD_PARTY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
+const GPL_3_URL: &str = "https://opensource.org/license/GPL-3.0";
+static THIRD_PARTY_LICENSES: LazyLock<Vec<ThirdPartyLicenseGroup>> =
+    LazyLock::new(|| third_party_license_groups(THIRD_PARTY_NOTICES));
+const PENDING_RELEASE_METADATA: &str =
+    "Secure installer metadata is still publishing for this release.";
 
 enum CatalogEvent {
-    Loaded(Channel, Manifest),
-    Failed(String),
+    Loaded(Channel, Vec<Manifest>),
+    Failed(Channel, String),
+}
+
+#[derive(Debug)]
+struct ThirdPartyLicenseGroup {
+    title: String,
+    packages: Vec<String>,
+    notices: Vec<String>,
+}
+
+fn fetch_catalog_async() -> Receiver<CatalogEvent> {
+    let (catalog_tx, catalog_rx) = mpsc::channel();
+    thread::spawn(move || match CatalogClient::new() {
+        Ok(client) => {
+            for channel in [Channel::Release, Channel::Beta] {
+                let event = match client.fetch_catalog(channel) {
+                    Ok(manifests) => CatalogEvent::Loaded(channel, manifests),
+                    Err(error) => CatalogEvent::Failed(channel, error.to_string()),
+                };
+                if catalog_tx.send(event).is_err() {
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            for channel in [Channel::Release, Channel::Beta] {
+                let _ = catalog_tx.send(CatalogEvent::Failed(channel, error.to_string()));
+            }
+        }
+    });
+    catalog_rx
 }
 
 enum OperationMessage {
@@ -48,6 +96,7 @@ enum OperationMessage {
 struct OperationFailure {
     message: String,
     cancelled: bool,
+    authorization_denied: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,11 +217,12 @@ enum Overlay {
 /// `SnapDog`'s guided three-step installer interface.
 pub struct SnapDogInstallerApp {
     catalog_rx: Receiver<CatalogEvent>,
-    stable: Option<Manifest>,
-    beta: Option<Manifest>,
+    stable: Option<Vec<Manifest>>,
+    beta: Option<Vec<Manifest>>,
     catalog_error: Option<String>,
     board: Option<Board>,
     channel: Channel,
+    selected_version: Option<String>,
     confirmed: Option<ImageSelection>,
     drives: Vec<Drive>,
     selected_drive: Option<Drive>,
@@ -189,23 +239,7 @@ impl SnapDogInstallerApp {
         egui_extras::install_image_loaders(&context.egui_ctx);
         configure_style(&context.egui_ctx);
 
-        let (catalog_tx, catalog_rx) = mpsc::channel();
-        thread::spawn(move || match CatalogClient::new() {
-            Ok(client) => {
-                for channel in [Channel::Release, Channel::Beta] {
-                    let event = match client.fetch_latest(channel) {
-                        Ok(manifest) => CatalogEvent::Loaded(channel, manifest),
-                        Err(error) => CatalogEvent::Failed(error.to_string()),
-                    };
-                    if catalog_tx.send(event).is_err() {
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = catalog_tx.send(CatalogEvent::Failed(error.to_string()));
-            }
-        });
+        let catalog_rx = fetch_catalog_async();
 
         Self {
             catalog_rx,
@@ -214,6 +248,7 @@ impl SnapDogInstallerApp {
             catalog_error: None,
             board: None,
             channel: Channel::Release,
+            selected_version: None,
             confirmed: None,
             drives: Vec::new(),
             selected_drive: None,
@@ -228,11 +263,34 @@ impl SnapDogInstallerApp {
     fn receive_catalog(&mut self) {
         while let Ok(event) = self.catalog_rx.try_recv() {
             match event {
-                CatalogEvent::Loaded(Channel::Release, manifest) => self.stable = Some(manifest),
-                CatalogEvent::Loaded(Channel::Beta, manifest) => self.beta = Some(manifest),
-                CatalogEvent::Failed(error) => self.catalog_error = Some(error),
+                CatalogEvent::Loaded(channel, manifests) => {
+                    if self.channel == channel && self.selected_version.is_none() {
+                        self.selected_version =
+                            manifests.first().map(|manifest| manifest.version.clone());
+                    }
+                    match channel {
+                        Channel::Release => self.stable = Some(manifests),
+                        Channel::Beta => self.beta = Some(manifests),
+                    }
+                    if self.channel == channel {
+                        self.catalog_error = None;
+                    }
+                }
+                CatalogEvent::Failed(channel, error) if self.channel == channel => {
+                    self.catalog_error = Some(error);
+                }
+                CatalogEvent::Failed(_, _) => {}
             }
         }
+    }
+
+    fn reload_catalog(&mut self) {
+        self.catalog_rx = fetch_catalog_async();
+        self.stable = None;
+        self.beta = None;
+        self.selected_version = None;
+        self.catalog_error = None;
+        self.clear_image_dependants();
     }
 
     fn receive_operation(&mut self, context: &egui::Context) {
@@ -258,6 +316,24 @@ impl SnapDogInstallerApp {
         };
 
         if let Some((result, selection, drive, phase, elapsed)) = transition {
+            match &result {
+                Ok(report) => tracing::info!(
+                    device = drive.device,
+                    stable_id = drive.id,
+                    bytes = report.raw_size,
+                    verified = report.verified,
+                    elapsed_ms = elapsed.as_millis(),
+                    "flash operation completed"
+                ),
+                Err(failure) => tracing::error!(
+                    device = drive.device,
+                    stable_id = drive.id,
+                    phase = ?phase,
+                    error = failure.message,
+                    elapsed_ms = elapsed.as_millis(),
+                    "flash operation failed"
+                ),
+            }
             self.operation = match result {
                 Ok(report) => OperationState::Succeeded(SuccessState {
                     report,
@@ -279,109 +355,182 @@ impl SnapDogInstallerApp {
         }
     }
 
-    const fn selected_manifest(&self) -> Option<&Manifest> {
+    fn selected_catalog(&self) -> Option<&[Manifest]> {
         match self.channel {
-            Channel::Release => self.stable.as_ref(),
-            Channel::Beta => self.beta.as_ref(),
+            Channel::Release => self.stable.as_deref(),
+            Channel::Beta => self.beta.as_deref(),
         }
+    }
+
+    fn selected_manifest(&self) -> Option<&Manifest> {
+        let catalog = self.selected_catalog()?;
+        self.selected_version
+            .as_deref()
+            .and_then(|selected| catalog.iter().find(|manifest| manifest.version == selected))
+            .or_else(|| catalog.first())
     }
 
     fn source_step(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             step_title(ui, "1. Choose image", true);
-            ui.add_space(16.0);
+            ui.add_space(12.0);
             ui.label(
                 RichText::new("Choose your Raspberry Pi")
-                    .size(17.0)
+                    .size(18.0)
                     .strong(),
             );
-            ui.add_space(12.0);
+            ui.add_space(8.0);
 
-            egui::Grid::new("board-grid")
-                .num_columns(2)
-                .spacing([18.0, 10.0])
-                .show(ui, |ui| {
-                    for (index, board) in Board::ALL.into_iter().enumerate() {
-                        let selected = self.board == Some(board);
-                        if board_button(ui, board, selected).clicked() {
-                            self.board = Some(board);
-                            self.clear_image_dependants();
-                        }
-                        if index % 2 == 1 {
-                            ui.end_row();
-                        }
-                    }
-                });
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Choose your version").size(17.0).strong());
-            ui.add_space(7.0);
-
-            ui.add_enabled_ui(self.board.is_some(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for channel in [Channel::Release, Channel::Beta] {
-                        let selected = self.channel == channel;
-                        let button = egui::Button::new(
-                            RichText::new(channel.label())
-                                .color(if selected { Color32::BLACK } else { MUTED })
-                                .strong(),
-                        )
-                        .fill(if selected { Color32::WHITE } else { SURFACE })
-                        .stroke(Stroke::new(1.0, Color32::from_gray(82)))
-                        .corner_radius(17.0)
-                        .min_size(Vec2::new(96.0, 34.0));
-                        if ui.add(button).clicked() {
-                            self.channel = channel;
-                            self.clear_image_dependants();
-                        }
-                    }
-                });
-            });
-            ui.add_space(7.0);
-
-            let version = self.selected_manifest().map_or_else(
-                || "Loading releases…".to_owned(),
-                |manifest| manifest.version.clone(),
-            );
-            ui.add_enabled_ui(
-                self.board.is_some() && self.selected_manifest().is_some(),
+            ui.allocate_ui_with_layout(
+                Vec2::new(BOARD_GRID_WIDTH, BOARD_GRID_HEIGHT),
+                Layout::top_down(Align::Center),
                 |ui| {
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(245, 243, 241))
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::symmetric(14, 10))
+                    egui::Grid::new("board-grid")
+                        .num_columns(2)
+                        .spacing([14.0, 6.0])
                         .show(ui, |ui| {
-                            ui.set_width(190.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!("{version} — Latest"))
-                                        .color(Color32::BLACK),
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(RichText::new("✓").color(GREEN).strong());
-                                });
-                            });
+                            for (index, board) in Board::ALL.into_iter().enumerate() {
+                                let selected = self.board == Some(board);
+                                if board_button(ui, board, selected).clicked() {
+                                    self.board = Some(board);
+                                    self.clear_image_dependants();
+                                }
+                                if index % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
                         });
                 },
             );
-            ui.add_space(7.0);
 
-            self.release_confirmation(ui, &version);
-
-            if self.channel == Channel::Beta {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Preview build — expect rough edges.")
-                        .color(ORANGE)
-                        .small(),
-                );
-            }
-            if let Some(error) = &self.catalog_error {
-                ui.add_space(4.0);
-                ui.label(RichText::new(error).color(DANGER).small());
-            }
+            self.version_section(ui);
         });
+    }
+
+    fn version_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(7.0);
+        ui.label(RichText::new("Choose your version").size(18.0).strong());
+        ui.add_space(6.0);
+        self.channel_picker(ui);
+        ui.add_space(6.0);
+
+        let version = self.selected_manifest().map_or_else(
+            || "Loading releases…".to_owned(),
+            |manifest| manifest.version.clone(),
+        );
+        self.version_picker(ui, &version);
+        ui.add_space(6.0);
+        self.release_confirmation(ui, &version);
+
+        if self.channel == Channel::Beta {
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new("Preview build — expect rough edges.")
+                    .color(ORANGE)
+                    .small(),
+            );
+        }
+        if let Some(error) = &self.catalog_error {
+            ui.add_space(3.0);
+            ui.label(RichText::new(error).color(DANGER).small());
+        }
+    }
+
+    fn channel_picker(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(VERSION_CONTROL_WIDTH, 34.0),
+            Layout::top_down(Align::Center),
+            |ui| {
+                ui.add_enabled_ui(self.board.is_some(), |ui| {
+                    egui::Frame::new()
+                        .fill(ELEVATED)
+                        .stroke(Stroke::new(1.0, Color32::from_gray(76)))
+                        .corner_radius(18.0)
+                        .inner_margin(egui::Margin::same(2))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for channel in [Channel::Release, Channel::Beta] {
+                                    let selected = self.channel == channel;
+                                    let button = egui::Button::new(
+                                        RichText::new(channel.label())
+                                            .color(if selected { Color32::BLACK } else { MUTED })
+                                            .strong(),
+                                    )
+                                    .fill(if selected {
+                                        Color32::from_rgb(244, 242, 240)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(15.0)
+                                    .min_size(Vec2::new(106.0, 30.0));
+                                    if ui.add(button).clicked() {
+                                        self.channel = channel;
+                                        self.selected_version = self
+                                            .selected_catalog()
+                                            .and_then(|catalog| catalog.first())
+                                            .map(|manifest| manifest.version.clone());
+                                        self.clear_image_dependants();
+                                        self.catalog_error = None;
+                                    }
+                                }
+                            });
+                        });
+                });
+            },
+        );
+    }
+
+    fn version_picker(&mut self, ui: &mut egui::Ui, version: &str) {
+        let releases = self.selected_catalog().map_or_else(Vec::new, |catalog| {
+            catalog
+                .iter()
+                .map(|manifest| manifest.version.clone())
+                .collect::<Vec<_>>()
+        });
+        let previous = self.selected_version.clone();
+        ui.allocate_ui_with_layout(
+            Vec2::new(VERSION_CONTROL_WIDTH, 40.0),
+            Layout::top_down(Align::Center),
+            |ui| {
+                ui.add_enabled_ui(self.board.is_some() && !releases.is_empty(), |ui| {
+                    let controls = &mut ui.style_mut().visuals.widgets;
+                    for visuals in [
+                        &mut controls.inactive,
+                        &mut controls.hovered,
+                        &mut controls.active,
+                        &mut controls.open,
+                    ] {
+                        visuals.bg_fill = Color32::from_rgb(245, 243, 241);
+                        visuals.weak_bg_fill = Color32::from_rgb(245, 243, 241);
+                        visuals.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+                        visuals.bg_stroke = Stroke::new(1.0, Color32::from_gray(198));
+                        visuals.corner_radius = 10.0.into();
+                    }
+                    egui::ComboBox::from_id_salt("release-version")
+                        .width(VERSION_CONTROL_WIDTH)
+                        .selected_text(RichText::new(version).color(Color32::BLACK))
+                        .show_ui(ui, |ui| {
+                            for (index, release) in releases.iter().enumerate() {
+                                let label = if index == 0 {
+                                    format!("{release} — Latest")
+                                } else {
+                                    release.clone()
+                                };
+                                ui.selectable_value(
+                                    &mut self.selected_version,
+                                    Some(release.clone()),
+                                    label,
+                                );
+                            }
+                        });
+                });
+            },
+        );
+        if self.selected_version != previous {
+            self.clear_image_dependants();
+        }
     }
 
     fn release_confirmation(&mut self, ui: &mut egui::Ui, version: &str) {
@@ -393,18 +542,53 @@ impl SnapDogInstallerApp {
             self.board.is_some() && self.selected_manifest().is_some() && release_error.is_none();
         let label = self.confirmed.as_ref().map_or_else(
             || format!("Use SnapDog OS {version}"),
-            |selection| format!("SnapDog OS {} selected ✓", selection.manifest.version),
+            |selection| format!("SnapDog OS {} selected", selection.manifest.version),
         );
         if ui
-            .add_enabled(can_confirm, primary_button(&label, Vec2::new(220.0, 40.0)))
+            .add_enabled(
+                can_confirm,
+                setup_action_button(&label, Vec2::new(220.0, 40.0), can_confirm),
+            )
             .clicked()
         {
             self.confirm_selection();
         }
 
         if let Some(error) = release_error {
-            ui.add_space(4.0);
-            ui.label(RichText::new(error).color(ORANGE).small());
+            ui.add_space(5.0);
+            if error == PENDING_RELEASE_METADATA {
+                let mut refresh = false;
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(114, 76, 40)))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(280.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(14.0));
+                            ui.label(
+                                RichText::new("Waiting for secure release metadata")
+                                    .color(MUTED)
+                                    .small(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let button =
+                                    egui::Button::new(RichText::new("Retry").color(TEXT).strong())
+                                        .fill(ELEVATED)
+                                        .stroke(Stroke::new(1.0, ORANGE))
+                                        .corner_radius(8.0)
+                                        .min_size(Vec2::new(68.0, 28.0));
+                                refresh = ui.add(button).clicked();
+                            });
+                        });
+                    });
+                if refresh {
+                    self.reload_catalog();
+                }
+            } else {
+                ui.label(RichText::new(error).color(ORANGE).small());
+            }
         }
     }
 
@@ -449,19 +633,21 @@ impl SnapDogInstallerApp {
     fn target_step(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             step_title(ui, "2. Target", self.confirmed.is_some());
-            ui.add_space(128.0);
-            ui.label(RichText::new("▰").size(48.0).color(MUTED));
-            ui.add_space(22.0);
+            ui.add_space(102.0);
             let ready = self.confirmed.is_some();
+            drive_icon(ui, if ready { ORANGE } else { SUBTLE }, 58.0);
+            ui.add_space(18.0);
             let label = self
                 .selected_drive
                 .as_ref()
                 .map_or("Select target", |_| "Change target");
-            let button = egui::Button::new(RichText::new(label).strong())
-                .fill(if ready { ORANGE } else { ELEVATED })
-                .corner_radius(22.0)
-                .min_size(Vec2::new(200.0, 46.0));
-            if ui.add_enabled(ready, button).clicked() {
+            if ui
+                .add_enabled(
+                    ready,
+                    setup_action_button(label, Vec2::new(200.0, 46.0), ready),
+                )
+                .clicked()
+            {
                 self.refresh_drives();
                 self.overlay = Some(Overlay::TargetPicker);
             }
@@ -475,7 +661,7 @@ impl SnapDogInstallerApp {
                         "Only removable physical drives are shown. System drives are excluded.",
                     )
                 } else {
-                    "Choose an image first"
+                    "Confirm the image selection first"
                 };
                 ui.label(RichText::new(status).color(MUTED).small());
             }
@@ -514,32 +700,34 @@ impl SnapDogInstallerApp {
             let request = self.pipeline_request();
             let ready = request.is_ok();
             step_title(ui, "3. Flash", ready);
-            ui.add_space(126.0);
-            ui.label(
-                RichText::new("ϟ")
-                    .size(58.0)
-                    .color(if ready { ORANGE } else { MUTED }),
-            );
-            ui.add_space(20.0);
-            let button = egui::Button::new(RichText::new("Flash!").strong())
-                .fill(if ready { ORANGE } else { ELEVATED })
-                .corner_radius(22.0)
-                .min_size(Vec2::new(200.0, 46.0));
-            if ui.add_enabled(ready, button).clicked() {
+            ui.add_space(99.0);
+            lightning_icon(ui, if ready { ORANGE } else { SUBTLE }, 62.0);
+            ui.add_space(17.0);
+            if ui
+                .add_enabled(
+                    ready,
+                    setup_action_button("Flash!", Vec2::new(200.0, 46.0), ready),
+                )
+                .clicked()
+            {
                 self.overlay = Some(Overlay::EraseConfirmation);
             }
             ui.add_space(8.0);
-            let status = match request {
-                Ok(_) => "Ready to download and flash",
-                Err(ref error) => error,
+            let status = if ready {
+                "Ready to download and flash"
+            } else if self.confirmed.is_none() {
+                "Complete the image selection first"
+            } else if self.selected_drive.is_none() {
+                "Select a target first"
+            } else {
+                request
+                    .as_ref()
+                    .err()
+                    .map_or("Review the previous steps", String::as_str)
             };
             ui.label(
                 RichText::new(status)
-                    .color(if ready {
-                        MUTED
-                    } else {
-                        Color32::from_gray(116)
-                    })
+                    .color(if ready { TEXT } else { MUTED })
                     .small(),
             );
         });
@@ -605,10 +793,7 @@ impl SnapDogInstallerApp {
             let result = execute_pipeline(&request, &background_control, |event| {
                 let _ = sender.send(OperationMessage::Event(event));
             });
-            let outcome = result.map_err(|error| OperationFailure {
-                cancelled: matches!(error, PipelineError::Cancelled),
-                message: error.to_string(),
-            });
+            let outcome = result.map_err(|error| operation_failure(&error));
             let _ = sender.send(OperationMessage::Finished(outcome));
         });
         self.operation = OperationState::Running(RunningOperation {
@@ -631,6 +816,11 @@ impl SnapDogInstallerApp {
         self.operation = OperationState::Idle;
         self.board = None;
         self.channel = Channel::Release;
+        self.selected_version = self
+            .stable
+            .as_deref()
+            .and_then(|catalog| catalog.first())
+            .map(|manifest| manifest.version.clone());
         self.confirmed = None;
         self.selected_drive = None;
         self.drives.clear();
@@ -648,8 +838,8 @@ impl SnapDogInstallerApp {
     }
 
     fn setup_screen(&mut self, ui: &mut egui::Ui) {
-        const SOURCE_WIDTH: f32 = 390.0;
-        const CONNECTOR_WIDTH: f32 = 55.0;
+        const SOURCE_WIDTH: f32 = 380.0;
+        const CONNECTOR_WIDTH: f32 = WORKFLOW_CONNECTOR_WIDTH;
         const STEP_WIDTH: f32 = 220.0;
         const RIGHT_WIDTH: f32 = STEP_WIDTH * 2.0 + CONNECTOR_WIDTH;
         const CONTENT_WIDTH: f32 = SOURCE_WIDTH + CONNECTOR_WIDTH + RIGHT_WIDTH;
@@ -658,7 +848,10 @@ impl SnapDogInstallerApp {
         let content_height = ui.available_height();
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(((ui.available_width() - CONTENT_WIDTH) / 2.0).max(0.0));
+            ui.add_space(
+                ((ui.available_width() - CONTENT_WIDTH) / 2.0 - WORKFLOW_OPTICAL_LEFT_SHIFT)
+                    .max(0.0),
+            );
             ui.allocate_ui_with_layout(
                 Vec2::new(SOURCE_WIDTH, content_height),
                 Layout::top_down(Align::Center),
@@ -688,8 +881,6 @@ impl SnapDogInstallerApp {
                             );
                         },
                     );
-                    ui.add_space(24.0);
-                    snapdog_logo(ui, Vec2::new(240.0, 115.0));
                 },
             );
         });
@@ -709,7 +900,7 @@ impl SnapDogInstallerApp {
             if self.drives.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(14.0);
-                    ui.label(RichText::new("▱").size(36.0).color(MUTED));
+                    drive_icon(ui, MUTED, 46.0);
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new(
@@ -910,12 +1101,19 @@ impl SnapDogInstallerApp {
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
                 ui.hyperlink_to(
-                    "Source & GPL-3.0 license",
+                    "Source code",
                     "https://github.com/SnapDogRocks/snapdog-os-installer",
                 );
-                if ui.link("Licenses & third-party notices").clicked() {
+                if ui.link("Third-party acknowledgements").clicked() {
                     show_notices = true;
                 }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("(C) 2026 Fabian Schmieder")
+                        .color(MUTED)
+                        .small(),
+                );
+                ui.hyperlink_to("Licensed under GPL-3", GPL_3_URL);
             });
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
@@ -937,35 +1135,30 @@ impl SnapDogInstallerApp {
     fn show_third_party_notices(&mut self, context: &egui::Context) {
         let mut back = false;
         let response = branded_modal(context, "third-party-notices", |ui| {
-            ui.set_width(680.0);
-            ui.heading("Open-source notices");
+            ui.set_width(640.0);
+            ui.heading("Open-source acknowledgements");
             ui.add_space(6.0);
             ui.label(
-                RichText::new("License texts embedded from the locked release dependency graph.")
+                RichText::new(
+                    "SnapDog OS Installer is built with these open-source libraries. Thank you to every maintainer and contributor.",
+                )
                     .color(MUTED),
             );
-            ui.add_space(10.0);
-            egui::Frame::new()
-                .fill(ELEVATED)
-                .corner_radius(10.0)
-                .inner_margin(egui::Margin::same(12))
+            ui.add_space(12.0);
+            ui.label(RichText::new("Licenses and libraries").strong());
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("third-party-acknowledgements-v2-scroll")
+                .max_height(330.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("third-party-notices-scroll")
-                        .max_height(460.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(THIRD_PARTY_NOTICES)
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(TEXT),
-                                )
-                                .wrap(),
-                            );
-                        });
+                    ui.set_width(640.0);
+                    for (index, license) in THIRD_PARTY_LICENSES.iter().enumerate() {
+                        third_party_license_card(ui, index, license);
+                        ui.add_space(7.0);
+                    }
                 });
-            ui.add_space(14.0);
+            ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 if ui
                     .add(primary_button("Back to Settings", Vec2::new(200.0, 42.0)))
@@ -1044,8 +1237,13 @@ impl eframe::App for SnapDogInstallerApp {
                     .inner_margin(egui::Margin::same(24)),
             )
             .show(context, |ui| {
-                self.top_bar(ui, context);
-                ui.add_space(10.0);
+                let setup = matches!(self.operation, OperationState::Idle);
+                if setup {
+                    self.setup_top_bar(ui);
+                } else {
+                    self.top_bar(ui);
+                    ui.add_space(10.0);
+                }
                 let action = match &mut self.operation {
                     OperationState::Idle => {
                         self.setup_screen(ui);
@@ -1055,6 +1253,11 @@ impl eframe::App for SnapDogInstallerApp {
                     OperationState::Succeeded(success) => success_screen(ui, success),
                     OperationState::Failed(failure) => failure_screen(ui, failure),
                 };
+                if setup {
+                    setup_logo(ui);
+                } else {
+                    operation_logo(ui);
+                }
                 match action {
                     ScreenAction::None => {}
                     ScreenAction::Cancel => {
@@ -1084,29 +1287,120 @@ impl eframe::App for SnapDogInstallerApp {
 }
 
 impl SnapDogInstallerApp {
-    fn top_bar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("?").size(19.0).strong()).frame(false))
-                    .on_hover_text("Open SnapDog help")
-                    .clicked()
-                {
-                    context.open_url(egui::OpenUrl::new_tab("https://snapdog.cc"));
-                }
-                let settings_enabled = matches!(self.operation, OperationState::Idle);
-                if ui
-                    .add_enabled(
-                        settings_enabled,
-                        egui::Button::new(RichText::new("⚙").size(24.0).color(TEXT)).frame(false),
-                    )
-                    .on_hover_text("Installer settings")
-                    .clicked()
-                {
-                    self.overlay = Some(Overlay::Settings);
-                }
-            });
-        });
+    fn setup_top_bar(&mut self, ui: &egui::Ui) {
+        // The icon boxes are taller than the step labels. Moving their boxes up by
+        // eight points aligns their optical centres without consuming layout space.
+        let top = ui.cursor().top() - 8.0;
+        let right = ui.max_rect().right();
+        let settings_rect =
+            egui::Rect::from_min_size(egui::pos2(right - 40.0, top), Vec2::splat(40.0));
+        if toolbar_icon_at(
+            ui,
+            settings_rect,
+            "setup-settings",
+            ToolbarIcon::Settings,
+            true,
+        )
+        .on_hover_text("Installer settings")
+        .clicked()
+        {
+            self.overlay = Some(Overlay::Settings);
+        }
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 40.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                self.top_bar_controls(ui);
+            },
+        );
+    }
+
+    fn top_bar_controls(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let settings_enabled = matches!(self.operation, OperationState::Idle);
+        if toolbar_icon_button(ui, ToolbarIcon::Settings, settings_enabled)
+            .on_hover_text("Installer settings")
+            .clicked()
+            && settings_enabled
+        {
+            self.overlay = Some(Overlay::Settings);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolbarIcon {
+    Settings,
+}
+
+fn toolbar_icon_button(ui: &mut egui::Ui, icon: ToolbarIcon, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), sense);
+    paint_toolbar_icon(ui, rect, &response, icon, enabled);
+    response.on_hover_cursor(if enabled {
+        egui::CursorIcon::PointingHand
+    } else {
+        egui::CursorIcon::Default
+    })
+}
+
+fn toolbar_icon_at(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    icon: ToolbarIcon,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, ui.make_persistent_id(id), sense);
+    paint_toolbar_icon(ui, rect, &response, icon, enabled);
+    response.on_hover_cursor(if enabled {
+        egui::CursorIcon::PointingHand
+    } else {
+        egui::CursorIcon::Default
+    })
+}
+
+fn paint_toolbar_icon(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    response: &egui::Response,
+    icon: ToolbarIcon,
+    enabled: bool,
+) {
+    if response.hovered() && enabled {
+        ui.painter().circle_filled(rect.center(), 19.0, ELEVATED);
+    }
+    let color = if enabled { TEXT } else { SUBTLE };
+    match icon {
+        ToolbarIcon::Settings => {
+            let center = rect.center();
+            let mut points = Vec::with_capacity(32);
+            for index in 0_u16..32 {
+                let angle = f32::from(index) * std::f32::consts::TAU / 32.0;
+                let radius = if index % 4 < 2 { 13.0 } else { 9.7 };
+                points.push(center + Vec2::new(angle.cos(), angle.sin()) * radius);
+            }
+            ui.painter()
+                .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+            let cutout = if response.hovered() && enabled {
+                ELEVATED
+            } else {
+                BACKGROUND
+            };
+            ui.painter().circle_filled(center, 4.2, cutout);
+        }
     }
 }
 
@@ -1198,8 +1492,6 @@ fn running_screen(ui: &mut egui::Ui, running: &RunningOperation) -> ScreenAction
                 }
             });
         }
-        ui.add_space(30.0);
-        snapdog_logo(ui, Vec2::new(210.0, 101.0));
     });
     action
 }
@@ -1211,7 +1503,7 @@ fn success_screen(ui: &mut egui::Ui, success: &SuccessState) -> ScreenAction {
         ui.set_width(600.0);
         phase_strip(ui, 5, success.report.verified);
         ui.add_space(30.0);
-        ui.label(RichText::new("✓").size(64.0).strong().color(GREEN));
+        success_icon(ui, 62.0);
         ui.label(RichText::new("Flash completed").size(29.0).strong());
         ui.add_space(8.0);
         ui.label(
@@ -1249,8 +1541,6 @@ fn success_screen(ui: &mut egui::Ui, success: &SuccessState) -> ScreenAction {
         {
             reset = true;
         }
-        ui.add_space(20.0);
-        snapdog_logo(ui, Vec2::new(210.0, 101.0));
     });
     if reset {
         ScreenAction::Reset
@@ -1261,7 +1551,12 @@ fn success_screen(ui: &mut egui::Ui, success: &SuccessState) -> ScreenAction {
 
 fn failure_screen(ui: &mut egui::Ui, failure: &FailureState) -> ScreenAction {
     let mut action = ScreenAction::None;
+    let requires_signed_bundle = failure
+        .failure
+        .message
+        .contains("signed SnapDog application bundle");
     let can_retry = !failure.failure.cancelled
+        && !requires_signed_bundle
         && matches!(
             failure.phase,
             OperationPhase::Downloading
@@ -1270,78 +1565,178 @@ fn failure_screen(ui: &mut egui::Ui, failure: &FailureState) -> ScreenAction {
                 | OperationPhase::ValidatingImage
         );
     let eject_only = !failure.failure.cancelled && failure.phase == OperationPhase::Ejecting;
-    ui.add_space(68.0);
+    let (title, guidance) = failure_copy(failure, requires_signed_bundle, eject_only);
+
+    ui.add_space(12.0);
     ui.vertical_centered(|ui| {
-        ui.set_width(590.0);
-        ui.label(
-            RichText::new(if failure.failure.cancelled { "×" } else { "!" })
-                .size(58.0)
-                .strong()
-                .color(if failure.failure.cancelled {
-                    ORANGE
-                } else {
-                    DANGER
-                }),
-        );
-        ui.label(
-            RichText::new(if failure.failure.cancelled {
-                "Flash cancelled"
+        ui.set_width(560.0);
+        failure_icon(
+            ui,
+            if failure.failure.cancelled {
+                ORANGE
             } else {
-                "Couldn’t complete the flash"
-            })
-            .size(27.0)
-            .strong(),
+                DANGER
+            },
+            failure.failure.cancelled,
         );
-        ui.add_space(8.0);
-        if failure.failure.cancelled
-            && matches!(
-                failure.phase,
-                OperationPhase::Writing
-                    | OperationPhase::Verifying
-                    | OperationPhase::Syncing
-                    | OperationPhase::Ejecting
-            )
-        {
-            ui.label(
-                RichText::new("The SD card may be incomplete and should be flashed again.")
-                    .color(ORANGE),
-            );
-            ui.add_space(8.0);
-        }
-        if eject_only {
-            ui.label(
-                RichText::new(
-                    "The image was written, but the system could not eject the card automatically. Use the operating system’s eject or safe-removal control before removing it.",
-                )
-                .color(ORANGE),
-            );
-            ui.add_space(8.0);
-        }
+        ui.add_space(10.0);
+        ui.label(RichText::new(title).size(26.0).strong());
+        ui.add_space(6.0);
+        ui.label(RichText::new(guidance).color(MUTED).size(14.0));
+        ui.add_space(16.0);
         egui::Frame::new()
             .fill(SURFACE)
+            .stroke(Stroke::new(1.0, Color32::from_gray(60)))
             .corner_radius(14.0)
-            .inner_margin(egui::Margin::symmetric(20, 14))
+            .inner_margin(egui::Margin::symmetric(20, 12))
             .show(ui, |ui| {
                 ui.set_width(500.0);
-                ui.label(RichText::new(&failure.failure.message).color(TEXT));
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{} • {} • {}",
-                        failure.phase.title(),
-                        failure.selection.board.label(),
-                        failure.drive.label()
-                    ))
-                    .color(MUTED)
-                    .small(),
+                let stage = if failure.phase == OperationPhase::Authorizing {
+                    if failure.failure.authorization_denied {
+                        "Authorization cancelled"
+                    } else {
+                        "Starting secure helper"
+                    }
+                } else {
+                    failure.phase.title().trim_end_matches('…')
+                };
+                summary_row(ui, "Stage", stage);
+                summary_row(
+                    ui,
+                    "Image",
+                    &format!(
+                        "SnapDog OS {} · {}",
+                        failure.selection.manifest.version,
+                        failure.selection.board.label()
+                    ),
                 );
+                summary_row(ui, "Target", &failure.drive.label());
+                ui.add_space(2.0);
+                egui::CollapsingHeader::new(
+                    RichText::new("Technical details").color(MUTED).small(),
+                )
+                .id_salt("operation-failure-details")
+                .default_open(
+                    failure.phase == OperationPhase::Authorizing
+                        && !failure.failure.authorization_denied,
+                )
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(&failure.failure.message)
+                            .color(SUBTLE)
+                            .small()
+                            .monospace(),
+                    );
+                });
             });
-        ui.add_space(22.0);
+        ui.add_space(14.0);
         action = failure_actions(ui, can_retry, eject_only);
-        ui.add_space(26.0);
-        snapdog_logo(ui, Vec2::new(210.0, 101.0));
     });
     action
+}
+
+fn failure_copy(
+    failure: &FailureState,
+    requires_signed_bundle: bool,
+    eject_only: bool,
+) -> (&'static str, &'static str) {
+    if failure.failure.cancelled {
+        let guidance = if matches!(
+            failure.phase,
+            OperationPhase::Writing
+                | OperationPhase::Verifying
+                | OperationPhase::Syncing
+                | OperationPhase::Ejecting
+        ) {
+            "The SD card may be incomplete. Flash it again before using it."
+        } else {
+            "No further changes will be made to the selected SD card."
+        };
+        return ("Flash cancelled", guidance);
+    }
+    if requires_signed_bundle {
+        return (
+            "Open the signed installer app",
+            "Raw-device access is available only from the signed SnapDog OS Installer in Applications.",
+        );
+    }
+    if eject_only {
+        return (
+            "The SD card is ready",
+            "The write completed, but the card could not be ejected automatically. Eject it in the operating system before removal.",
+        );
+    }
+    match failure.phase {
+        OperationPhase::Downloading => (
+            "Couldn’t download SnapDog OS",
+            "Check the network connection, then try the download again.",
+        ),
+        OperationPhase::Decompressing | OperationPhase::ValidatingImage => (
+            "The image could not be prepared",
+            "The downloaded release did not pass all safety checks. The SD card was not written.",
+        ),
+        OperationPhase::Authorizing if failure.failure.authorization_denied => (
+            "Permission was not granted",
+            "Approve the system prompt so the installer can write to the selected SD card.",
+        ),
+        OperationPhase::Authorizing => (
+            "Couldn’t start the secure helper",
+            "The protected writing process could not start. No data was written to the SD card.",
+        ),
+        OperationPhase::ValidatingTarget | OperationPhase::Unmounting => (
+            "The target is no longer available",
+            "Reconnect the SD card, return to setup, and select it again.",
+        ),
+        OperationPhase::Writing | OperationPhase::Verifying | OperationPhase::Syncing => (
+            "Couldn’t complete the flash",
+            "The SD card may be incomplete. Return to setup and flash it again.",
+        ),
+        OperationPhase::Ejecting => unreachable!("eject failures are handled above"),
+    }
+}
+
+fn operation_failure(error: &PipelineError) -> OperationFailure {
+    let cancelled = matches!(&error, PipelineError::Cancelled);
+    let authorization_denied = matches!(
+        &error,
+        PipelineError::Runner(WorkerRunnerError::AuthorizationDenied)
+    );
+    OperationFailure {
+        message: error.to_string(),
+        cancelled,
+        authorization_denied,
+    }
+}
+
+fn failure_icon(ui: &mut egui::Ui, color: Color32, cancelled: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(50.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.circle_stroke(rect.center(), 22.0, Stroke::new(2.5, color));
+    if cancelled {
+        painter.line_segment(
+            [
+                rect.center() + Vec2::new(-7.0, -7.0),
+                rect.center() + Vec2::new(7.0, 7.0),
+            ],
+            Stroke::new(2.8, color),
+        );
+        painter.line_segment(
+            [
+                rect.center() + Vec2::new(7.0, -7.0),
+                rect.center() + Vec2::new(-7.0, 7.0),
+            ],
+            Stroke::new(2.8, color),
+        );
+    } else {
+        painter.line_segment(
+            [
+                rect.center() + Vec2::new(0.0, -10.0),
+                rect.center() + Vec2::new(0.0, 5.0),
+            ],
+            Stroke::new(3.0, color),
+        );
+        painter.circle_filled(rect.center() + Vec2::new(0.0, 12.0), 2.0, color);
+    }
 }
 
 fn failure_actions(ui: &mut egui::Ui, can_retry: bool, eject_only: bool) -> ScreenAction {
@@ -1355,14 +1750,17 @@ fn failure_actions(ui: &mut egui::Ui, can_retry: bool, eject_only: bool) -> Scre
     } else if can_retry {
         let mut action = ScreenAction::None;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let actions_width = 214.0_f32.mul_add(2.0, ui.spacing().item_spacing.x);
+            ui.add_space(((ui.available_width() - actions_width) / 2.0).max(0.0));
             if ui
-                .add(secondary_button("Back to setup", Vec2::new(220.0, 46.0)))
+                .add(secondary_button("Back to setup", Vec2::new(214.0, 44.0)))
                 .clicked()
             {
                 action = ScreenAction::Back;
             }
             if ui
-                .add(primary_button("Retry", Vec2::new(220.0, 46.0)))
+                .add(primary_button("Retry", Vec2::new(214.0, 44.0)))
                 .clicked()
             {
                 action = ScreenAction::Retry;
@@ -1370,10 +1768,7 @@ fn failure_actions(ui: &mut egui::Ui, can_retry: bool, eject_only: bool) -> Scre
         });
         return action;
     } else if ui
-        .add(primary_button(
-            "Choose target again",
-            Vec2::new(260.0, 46.0),
-        ))
+        .add(primary_button("Back to setup", Vec2::new(260.0, 46.0)))
         .clicked()
     {
         return ScreenAction::Back;
@@ -1393,7 +1788,21 @@ fn apply_pipeline_event(running: &mut RunningOperation, event: PipelineEvent) {
             running.processed = None;
             running.total = None;
         }
-        PipelineEvent::Worker(progress) => apply_worker_progress(running, &progress),
+        PipelineEvent::Worker(progress) => {
+            // Byte-level progress can arrive for every MiB of a multi-gigabyte image. The UI still
+            // consumes every update, but the diagnostic log records phase transitions and messages
+            // rather than turning image preparation into thousands of synchronous file writes.
+            if progress.bytes_processed.is_none() || progress.message.is_some() {
+                tracing::debug!(
+                    phase = ?progress.phase,
+                    processed = ?progress.bytes_processed,
+                    total = ?progress.total_bytes,
+                    message = progress.message.as_deref().unwrap_or(""),
+                    "received privileged worker progress"
+                );
+            }
+            apply_worker_progress(running, &progress);
+        }
     }
 }
 
@@ -1436,8 +1845,9 @@ fn execute_pipeline<F>(
 where
     F: FnMut(PipelineEvent),
 {
-    let downloader = DownloadClient::new()?;
     let runner = MacOsWorkerRunner::current()?;
+    runner.prime_removable_volume_access(&request.drive.device)?;
+    let downloader = DownloadClient::new()?;
     run_pipeline(request, &downloader, &runner, control, emit)
 }
 
@@ -1487,9 +1897,7 @@ const fn supports_manifest_schema(schema_version: Option<u32>) -> bool {
 
 fn validate_release_image(manifest: &Manifest, board: Board) -> Result<(), String> {
     if !supports_manifest_schema(manifest.schema_version) {
-        return Err(
-            "This release is waiting for safe installer metadata. Try again shortly.".to_owned(),
-        );
+        return Err(PENDING_RELEASE_METADATA.to_owned());
     }
     let image = manifest
         .image_for(board)
@@ -1542,44 +1950,45 @@ fn step_title(ui: &mut egui::Ui, title: &str, active: bool) {
 
 fn connector(ui: &mut egui::Ui, enabled: bool, height: f32) {
     ui.allocate_ui_with_layout(
-        Vec2::new(55.0, height),
+        Vec2::new(WORKFLOW_CONNECTOR_WIDTH, height),
         Layout::top_down(Align::Center),
         |ui| {
-            ui.add_space(181.0);
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(55.0, 12.0), egui::Sense::hover());
+            ui.add_space(STEP_ICON_CENTER_Y - 6.0);
+            let (rect, _) = ui.allocate_exact_size(
+                Vec2::new(WORKFLOW_CONNECTOR_WIDTH, 12.0),
+                egui::Sense::hover(),
+            );
             let color = if enabled {
                 ORANGE
             } else {
-                Color32::from_gray(58)
+                Color32::from_gray(66)
             };
             ui.painter().line_segment(
                 [
                     rect.left_center(),
-                    rect.right_center() - Vec2::new(6.0, 0.0),
+                    rect.right_center() - Vec2::new(8.0, 0.0),
                 ],
                 Stroke::new(1.5, color),
             );
-            ui.painter().text(
-                rect.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                "›",
-                FontId::proportional(19.0),
-                color,
-            );
+            let tip = rect.right_center();
+            ui.painter()
+                .line_segment([tip - Vec2::new(8.0, 5.0), tip], Stroke::new(1.5, color));
+            ui.painter()
+                .line_segment([tip, tip - Vec2::new(8.0, -5.0)], Stroke::new(1.5, color));
         },
     );
 }
 
 fn board_button(ui: &mut egui::Ui, board: Board, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(150.0, 142.0), egui::Sense::click());
-    let center = rect.center_top() + Vec2::new(0.0, 57.0);
-    let radius = 55.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(144.0, 134.0), egui::Sense::click());
+    let center = rect.center_top() + Vec2::new(0.0, 53.0);
+    let radius = 51.0;
     let fill = Color32::from_rgb(255, 240, 212);
     if selected {
         ui.painter().circle_filled(
             center,
-            radius + 9.0,
-            Color32::from_rgba_premultiplied(255, 159, 10, 42),
+            radius + 6.0,
+            Color32::from_rgba_premultiplied(255, 159, 10, 32),
         );
     }
     ui.painter().circle_filled(center, radius, fill);
@@ -1587,7 +1996,7 @@ fn board_button(ui: &mut egui::Ui, board: Board, selected: bool) -> egui::Respon
         center,
         radius,
         Stroke::new(
-            if selected { 5.0 } else { 2.0 },
+            if selected { 3.2 } else { 2.0 },
             if selected {
                 BRIGHT_ORANGE
             } else {
@@ -1596,23 +2005,17 @@ fn board_button(ui: &mut egui::Ui, board: Board, selected: bool) -> egui::Respon
         ),
     );
 
-    let image_rect = egui::Rect::from_center_size(center, Vec2::splat(94.0));
+    let image_rect = egui::Rect::from_center_size(center, Vec2::splat(88.0));
     egui::Image::new(board_image(board))
         .fit_to_exact_size(image_rect.size())
         .paint_at(ui, image_rect);
 
     if selected {
-        let badge = center + Vec2::new(43.0, -42.0);
-        ui.painter().circle_filled(badge, 16.0, BRIGHT_ORANGE);
+        let badge = center + Vec2::new(40.0, -39.0);
+        ui.painter().circle_filled(badge, 15.0, BRIGHT_ORANGE);
         ui.painter()
-            .circle_stroke(badge, 16.0, Stroke::new(3.0, BACKGROUND));
-        ui.painter().text(
-            badge,
-            egui::Align2::CENTER_CENTER,
-            "✓",
-            FontId::proportional(17.0),
-            Color32::BLACK,
-        );
+            .circle_stroke(badge, 15.0, Stroke::new(3.0, BACKGROUND));
+        paint_checkmark(ui.painter(), badge, 15.0, Color32::BLACK, 2.4);
     }
 
     ui.painter().text(
@@ -1633,6 +2036,107 @@ const fn board_image(board: Board) -> egui::ImageSource<'static> {
         Board::Pi3 => egui::include_image!("../assets/rpi/pi3.png"),
         Board::Zero2W => egui::include_image!("../assets/rpi/zero2w.png"),
     }
+}
+
+fn paint_checkmark(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: Color32,
+    width: f32,
+) {
+    painter.line_segment(
+        [
+            center + Vec2::new(-size * 0.34, 0.0),
+            center + Vec2::new(-size * 0.08, size * 0.25),
+        ],
+        Stroke::new(width, color),
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-size * 0.08, size * 0.25),
+            center + Vec2::new(size * 0.38, -size * 0.30),
+        ],
+        Stroke::new(width, color),
+    );
+}
+
+fn success_icon(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.36, GREEN);
+    paint_checkmark(
+        ui.painter(),
+        rect.center(),
+        size * 0.34,
+        Color32::BLACK,
+        3.2,
+    );
+}
+
+fn drive_icon(ui: &mut egui::Ui, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    let center = rect.center();
+    let body = egui::Rect::from_center_size(
+        center + Vec2::new(0.0, -1.0),
+        Vec2::new(size * 0.58, size * 0.68),
+    );
+    ui.painter().rect_filled(body, 6.0, ELEVATED);
+    ui.painter()
+        .rect_stroke(body, 6.0, Stroke::new(2.6, color), egui::StrokeKind::Inside);
+    let baseline_y = size.mul_add(-0.15, body.bottom());
+    ui.painter().line_segment(
+        [
+            egui::pos2(size.mul_add(0.10, body.left()), baseline_y),
+            egui::pos2(size.mul_add(-0.10, body.right()), baseline_y),
+        ],
+        Stroke::new(2.0, color),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(
+            size.mul_add(0.13, body.left()),
+            size.mul_add(-0.08, body.bottom()),
+        ),
+        size * 0.025,
+        color,
+    );
+}
+
+fn lightning_icon(ui: &mut egui::Ui, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    let center = rect.center();
+    let points = [
+        center + Vec2::new(size * 0.03, -size * 0.43),
+        center + Vec2::new(-size * 0.28, size * 0.02),
+        center + Vec2::new(-size * 0.04, size * 0.02),
+        center + Vec2::new(-size * 0.12, size * 0.43),
+        center + Vec2::new(size * 0.30, -size * 0.12),
+        center + Vec2::new(size * 0.06, -size * 0.12),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        points.to_vec(),
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn setup_action_button(label: &str, size: Vec2, enabled: bool) -> egui::Button<'_> {
+    egui::Button::new(
+        RichText::new(label)
+            .color(if enabled { Color32::BLACK } else { TEXT })
+            .strong(),
+    )
+    .fill(if enabled { ORANGE } else { ELEVATED })
+    .stroke(Stroke::new(
+        1.0,
+        if enabled {
+            Color32::from_rgb(242, 154, 65)
+        } else {
+            Color32::from_gray(70)
+        },
+    ))
+    .corner_radius(size.y / 2.0)
+    .min_size(size)
 }
 
 fn phase_strip(ui: &mut egui::Ui, current: usize, verification_expected: bool) {
@@ -1705,12 +2209,149 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(5.0);
 }
 
-fn snapdog_logo(ui: &mut egui::Ui, size: Vec2) {
-    let response = ui.add(
-        egui::Image::new(egui::include_image!("../assets/snapdog-logo.svg"))
-            .fit_to_exact_size(size)
-            .sense(egui::Sense::click()),
+fn third_party_license_card(ui: &mut egui::Ui, index: usize, license: &ThirdPartyLicenseGroup) {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, Color32::from_gray(58)))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::symmetric(14, 11))
+        .show(ui, |ui| {
+            ui.set_width(610.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&license.title).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let count = license.packages.len();
+                    ui.label(
+                        RichText::new(format!(
+                            "{count} {}",
+                            if count == 1 { "library" } else { "libraries" }
+                        ))
+                        .color(MUTED)
+                        .small(),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(license.packages.join(", "))
+                    .color(MUTED)
+                    .small(),
+            );
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(
+                RichText::new("License text and notices")
+                    .color(ORANGE)
+                    .small(),
+            )
+            .id_salt(("third-party-license", index))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                for (notice_index, notice) in license.notices.iter().enumerate() {
+                    if license.notices.len() > 1 {
+                        ui.label(
+                            RichText::new(format!("Notice {}", notice_index + 1))
+                                .color(TEXT)
+                                .strong()
+                                .small(),
+                        );
+                        ui.add_space(3.0);
+                    }
+                    ui.add(
+                        egui::Label::new(RichText::new(notice).color(MUTED).size(11.0))
+                            .wrap()
+                            .selectable(true),
+                    );
+                    if notice_index + 1 < license.notices.len() {
+                        ui.separator();
+                    }
+                }
+            });
+        });
+}
+
+fn third_party_license_groups(notices: &str) -> Vec<ThirdPartyLicenseGroup> {
+    let mut groups: Vec<ThirdPartyLicenseGroup> = Vec::new();
+    for section in notices
+        .split("================================================================================")
+    {
+        let section = section.trim();
+        let Some((title, body)) = section.split_once("\n\nUsed by:\n") else {
+            continue;
+        };
+        let Some((packages, notice)) = body.split_once("\n\n") else {
+            continue;
+        };
+        let title = decode_notice_title(title.trim());
+        let packages = packages
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if packages.is_empty() || notice.trim().is_empty() {
+            continue;
+        }
+        let notice = notice.trim().to_owned();
+        if let Some(group) = groups.iter_mut().find(|group| group.title == title) {
+            group.packages.extend(packages);
+            if !group.notices.contains(&notice) {
+                group.notices.push(notice);
+            }
+        } else {
+            groups.push(ThirdPartyLicenseGroup {
+                title,
+                packages,
+                notices: vec![notice],
+            });
+        }
+    }
+    for group in &mut groups {
+        group.packages.sort();
+        group.packages.dedup();
+    }
+    groups
+}
+
+fn decode_notice_title(title: &str) -> String {
+    title
+        .replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&#x27;", "'")
+}
+
+fn setup_logo(ui: &egui::Ui) {
+    let bounds = ui.max_rect();
+    let size = snapdog_logo_size(210.0);
+    let center = egui::pos2(
+        bounds.width().mul_add(0.75, bounds.left()),
+        bounds.bottom() - 64.0 - size.y / 2.0,
     );
+    snapdog_logo_at(ui, egui::Rect::from_center_size(center, size), "setup-logo");
+}
+
+fn operation_logo(ui: &egui::Ui) {
+    let bounds = ui.max_rect();
+    let size = snapdog_logo_size(96.0);
+    let center = egui::pos2(
+        bounds.right() - 24.0 - size.x / 2.0,
+        bounds.bottom() - 18.0 - size.y / 2.0,
+    );
+    snapdog_logo_at(
+        ui,
+        egui::Rect::from_center_size(center, size),
+        "operation-logo",
+    );
+}
+
+fn snapdog_logo_size(width: f32) -> Vec2 {
+    Vec2::new(width, width / SNAPDOG_LOGO_ASPECT_RATIO)
+}
+
+fn snapdog_logo_at(ui: &egui::Ui, rect: egui::Rect, id: &str) {
+    let response = ui.interact(rect, ui.make_persistent_id(id), egui::Sense::click());
+    egui::Image::new(egui::include_image!("../assets/snapdog-logo.svg"))
+        .fit_to_exact_size(rect.size())
+        .paint_at(ui, rect);
     if response.on_hover_text("Open snapdog.cc").clicked() {
         ui.ctx()
             .open_url(egui::OpenUrl::new_tab("https://snapdog.cc"));
@@ -1829,5 +2470,48 @@ mod tests {
         assert_eq!(progress_fraction(Some(50), Some(100)), Some(0.5));
         assert_eq!(progress_fraction(Some(200), Some(100)), Some(1.0));
         assert_eq!(progress_fraction(Some(1), None), None);
+    }
+
+    #[test]
+    fn distinguishes_denied_authorization_from_an_early_helper_failure() {
+        let denied = operation_failure(&PipelineError::Runner(
+            WorkerRunnerError::AuthorizationDenied,
+        ));
+        assert!(denied.authorization_denied);
+        assert!(!denied.cancelled);
+
+        let helper_failure = operation_failure(&PipelineError::Runner(WorkerRunnerError::Failed {
+            status: "exit status: 1".to_owned(),
+            message: "signed helper failed before its first event".to_owned(),
+        }));
+        assert!(!helper_failure.authorization_denied);
+        assert!(!helper_failure.cancelled);
+    }
+
+    #[test]
+    fn acknowledgements_group_dependencies_and_embed_all_license_texts() {
+        let licenses = third_party_license_groups(THIRD_PARTY_NOTICES);
+        assert!(!licenses.is_empty());
+        let gpl = licenses
+            .iter()
+            .find(|license| license.title.contains("GPL-3.0-only"))
+            .expect("the application GPL entry remains visible");
+        assert!(!gpl.notices.is_empty());
+        assert!(
+            gpl.notices
+                .iter()
+                .any(|notice| notice.contains("GNU GENERAL PUBLIC LICENSE"))
+        );
+        assert!(
+            gpl.packages
+                .iter()
+                .any(|package| package.starts_with("snapdog-os-installer "))
+        );
+        assert!(
+            licenses
+                .iter()
+                .any(|license| license.title.contains("MIT") && !license.packages.is_empty())
+        );
+        assert_eq!(decode_notice_title("BSD &quot;New&quot;"), "BSD \"New\"");
     }
 }

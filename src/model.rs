@@ -93,6 +93,14 @@ pub struct Manifest {
     pub boards: BTreeMap<String, ImageInfo>,
 }
 
+/// Bounded, newest-first release list published for one channel.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReleaseCatalog {
+    pub schema_version: u32,
+    pub channel: Channel,
+    pub releases: Vec<Manifest>,
+}
+
 impl Manifest {
     /// Return the selected board image, when present.
     pub fn image_for(&self, board: Board) -> Option<&ImageInfo> {

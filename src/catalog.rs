@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::{StatusCode, blocking::Client};
 use semver::Version;
 use thiserror::Error;
 
-use crate::model::{Board, Channel, Manifest};
+use crate::model::{Board, Channel, Manifest, ReleaseCatalog};
 
 pub const IMAGE_BASE_URL: &str = "https://updates.snapdog.cc/os/images/";
 
@@ -53,6 +53,25 @@ impl CatalogClient {
         Ok(manifest)
     }
 
+    /// Fetch all safely installable releases for a channel.
+    ///
+    /// Older servers that do not publish catalogs yet fall back to the latest
+    /// manifest. Invalid catalogs never fall back silently.
+    pub fn fetch_catalog(&self, channel: Channel) -> Result<Vec<Manifest>, CatalogError> {
+        let url = format!("{IMAGE_BASE_URL}catalog-{}.json", channel.manifest_name());
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return self.fetch_latest(channel).map(|manifest| vec![manifest]);
+        }
+        let catalog: ReleaseCatalog = response.error_for_status()?.json()?;
+        validate_catalog(&catalog, channel)?;
+        Ok(catalog.releases)
+    }
+
     /// Resolve an image name or absolute URL without accepting other schemes.
     pub fn image_url(image: &str) -> Result<String, CatalogError> {
         let base = reqwest::Url::parse(IMAGE_BASE_URL)
@@ -65,6 +84,57 @@ impl CatalogClient {
         }
         Ok(url.into())
     }
+}
+
+fn validate_catalog(catalog: &ReleaseCatalog, channel: Channel) -> Result<(), CatalogError> {
+    if catalog.schema_version != 1 {
+        return Err(CatalogError::InvalidManifest(format!(
+            "unsupported catalog schema version {}",
+            catalog.schema_version
+        )));
+    }
+    if catalog.channel != channel {
+        return Err(CatalogError::InvalidManifest(format!(
+            "catalog channel {:?} does not match {:?}",
+            catalog.channel, channel
+        )));
+    }
+    if catalog.releases.is_empty() || catalog.releases.len() > 20 {
+        return Err(CatalogError::InvalidManifest(
+            "catalog must contain between 1 and 20 releases".to_owned(),
+        ));
+    }
+
+    let mut previous: Option<Version> = None;
+    let mut versions = std::collections::BTreeSet::new();
+    for manifest in &catalog.releases {
+        validate_download_manifest(manifest)?;
+        if manifest.channel != channel {
+            return Err(CatalogError::InvalidManifest(format!(
+                "release {} belongs to the wrong channel",
+                manifest.version
+            )));
+        }
+        let version = Version::parse(&manifest.version).map_err(|_| {
+            CatalogError::InvalidManifest(format!(
+                "invalid SnapDog OS version {:?}",
+                manifest.version
+            ))
+        })?;
+        if !versions.insert(manifest.version.clone()) {
+            return Err(CatalogError::InvalidManifest(format!(
+                "duplicate release version {}",
+                manifest.version
+            )));
+        }
+        if previous.as_ref().is_some_and(|newer| newer < &version) {
+            return Err(CatalogError::InvalidManifest(
+                "catalog releases are not sorted newest first".to_owned(),
+            ));
+        }
+        previous = Some(version);
+    }
+    Ok(())
 }
 
 fn validate_download_manifest(manifest: &Manifest) -> Result<(), CatalogError> {
@@ -172,7 +242,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::model::ImageInfo;
+    use crate::model::{ImageInfo, ReleaseCatalog};
 
     fn manifest(schema_version: Option<u32>, version: &str) -> Manifest {
         let boards = Board::ALL
@@ -273,5 +343,41 @@ mod tests {
     #[test]
     fn rejects_unknown_manifest_schema() {
         assert!(validate_download_manifest(&manifest(Some(3), "1.2.3")).is_err());
+    }
+
+    #[test]
+    fn accepts_newest_first_catalog() {
+        let catalog = ReleaseCatalog {
+            schema_version: 1,
+            channel: Channel::Release,
+            releases: vec![manifest(Some(2), "1.2.3"), manifest(Some(2), "1.2.2")],
+        };
+
+        assert!(validate_catalog(&catalog, Channel::Release).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_catalog_shapes() {
+        let valid = ReleaseCatalog {
+            schema_version: 1,
+            channel: Channel::Release,
+            releases: vec![manifest(Some(2), "1.2.3"), manifest(Some(2), "1.2.2")],
+        };
+
+        let mut unsorted = valid.clone();
+        unsorted.releases.reverse();
+        assert!(validate_catalog(&unsorted, Channel::Release).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate.releases[1] = duplicate.releases[0].clone();
+        assert!(validate_catalog(&duplicate, Channel::Release).is_err());
+
+        let mut wrong_channel = valid.clone();
+        wrong_channel.channel = Channel::Beta;
+        assert!(validate_catalog(&wrong_channel, Channel::Release).is_err());
+
+        let mut unknown_schema = valid;
+        unknown_schema.schema_version = 2;
+        assert!(validate_catalog(&unknown_schema, Channel::Release).is_err());
     }
 }
