@@ -58,15 +58,32 @@ mod platform {
     struct IoMedia {
         #[serde(rename = "BSD Name")]
         bsd_name: Option<String>,
+        #[serde(rename = "IORegistryEntryName")]
+        name: Option<String>,
         #[serde(rename = "IORegistryEntryID")]
         registry_entry_id: Option<u64>,
+        #[serde(rename = "Size")]
+        size: Option<u64>,
         #[serde(rename = "Whole")]
         whole: Option<bool>,
+        #[serde(rename = "Writable")]
+        writable: Option<bool>,
+        #[serde(rename = "Removable")]
+        removable: Option<bool>,
+        #[serde(rename = "Ejectable")]
+        ejectable: Option<bool>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct SafeMedia {
+        registry_entry_id: u64,
+        name: Option<String>,
+        size: u64,
     }
 
     pub(super) fn removable_drives() -> Result<Vec<Drive>, DriveError> {
         let output = Command::new("/usr/sbin/diskutil")
-            .args(["list", "-plist", "external", "physical"])
+            .args(["list", "-plist", "physical"])
             .output()?;
         if !output.status.success() {
             return Err(DriveError::InvalidData(
@@ -77,7 +94,7 @@ mod platform {
         parse_diskutil(&output.stdout, &registry_entries)
     }
 
-    fn media_registry_entries() -> Result<BTreeMap<String, u64>, DriveError> {
+    fn media_registry_entries() -> Result<BTreeMap<String, SafeMedia>, DriveError> {
         let output = Command::new("/usr/sbin/ioreg")
             .args(["-r", "-c", "IOMedia", "-a"])
             .output()?;
@@ -89,21 +106,40 @@ mod platform {
         parse_ioreg(&output.stdout)
     }
 
-    fn parse_ioreg(bytes: &[u8]) -> Result<BTreeMap<String, u64>, DriveError> {
+    fn parse_ioreg(bytes: &[u8]) -> Result<BTreeMap<String, SafeMedia>, DriveError> {
         let entries: Vec<IoMedia> =
             plist::from_bytes(bytes).map_err(|error| DriveError::InvalidData(error.to_string()))?;
         let mut identities = BTreeMap::new();
+        let mut registry_ids = std::collections::BTreeSet::new();
         for entry in entries {
-            let (Some(name), Some(registry_entry_id)) = (entry.bsd_name, entry.registry_entry_id)
+            let (Some(bsd_name), Some(registry_entry_id), Some(size)) =
+                (entry.bsd_name, entry.registry_entry_id, entry.size)
             else {
                 continue;
             };
-            if entry.whole != Some(true) || !valid_identifier(&name) || registry_entry_id == 0 {
+            if entry.whole != Some(true)
+                || entry.writable != Some(true)
+                || entry.removable != Some(true)
+                || entry.ejectable != Some(true)
+                || !valid_identifier(&bsd_name)
+                || registry_entry_id == 0
+                || size == 0
+            {
                 continue;
             }
-            if identities.insert(name.clone(), registry_entry_id).is_some() {
+            if !registry_ids.insert(registry_entry_id) {
                 return Err(DriveError::InvalidData(format!(
-                    "duplicate I/O Registry identity for {name}"
+                    "duplicate I/O Registry entry ID {registry_entry_id}"
+                )));
+            }
+            let media = SafeMedia {
+                registry_entry_id,
+                name: entry.name.filter(|name| !name.trim().is_empty()),
+                size,
+            };
+            if identities.insert(bsd_name.clone(), media).is_some() {
+                return Err(DriveError::InvalidData(format!(
+                    "duplicate I/O Registry identity for {bsd_name}"
                 )));
             }
         }
@@ -112,31 +148,40 @@ mod platform {
 
     fn parse_diskutil(
         bytes: &[u8],
-        registry_entries: &BTreeMap<String, u64>,
+        registry_entries: &BTreeMap<String, SafeMedia>,
     ) -> Result<Vec<Drive>, DriveError> {
         let list: DiskList =
             plist::from_bytes(bytes).map_err(|error| DriveError::InvalidData(error.to_string()))?;
-        Ok(list
-            .disks
-            .into_iter()
-            .filter_map(|disk| {
-                let size = disk.size.filter(|size| *size > 0)?;
-                if !valid_identifier(&disk.id) {
-                    return None;
-                }
-                let registry_entry_id = registry_entries.get(&disk.id)?;
-                let name = disk
-                    .name
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| "Removable drive".to_owned());
-                Some(Drive {
-                    device: format!("/dev/{}", disk.id),
-                    id: format_stable_identifier(&disk.id, *registry_entry_id),
-                    name,
-                    capacity: size,
-                })
-            })
-            .collect())
+        let mut drives = Vec::new();
+        for disk in list.disks {
+            let Some(size) = disk.size.filter(|size| *size > 0) else {
+                continue;
+            };
+            if !valid_identifier(&disk.id) {
+                continue;
+            }
+            let Some(media) = registry_entries.get(&disk.id) else {
+                continue;
+            };
+            if media.size != size {
+                return Err(DriveError::InvalidData(format!(
+                    "size mismatch for {} between diskutil ({size}) and I/O Registry ({})",
+                    disk.id, media.size
+                )));
+            }
+            let name = disk
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .or_else(|| media.name.clone())
+                .unwrap_or_else(|| "Removable drive".to_owned());
+            drives.push(Drive {
+                device: format!("/dev/{}", disk.id),
+                id: format_stable_identifier(&disk.id, media.registry_entry_id),
+                name,
+                capacity: size,
+            });
+        }
+        Ok(drives)
     }
 
     fn valid_identifier(id: &str) -> bool {
@@ -166,40 +211,108 @@ mod platform {
         use super::*;
 
         #[test]
-        fn parses_external_physical_disk() {
-            let registry_entries = BTreeMap::from([("disk7".to_owned(), 4_242)]);
-            let document = br#"<?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0"><dict><key>AllDisksAndPartitions</key><array><dict>
-            <key>DeviceIdentifier</key><string>disk7</string>
-            <key>MediaName</key><string>SD Card Reader</string>
-            <key>Size</key><integer>31900000000</integer>
-            </dict></array></dict></plist>"#;
-            let drives = parse_diskutil(document, &registry_entries).unwrap();
+        fn discovers_builtin_sd_and_excludes_fixed_and_virtual_media() {
+            let registry_document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><array>
+            <dict><key>BSD Name</key><string>disk0</string>
+            <key>IORegistryEntryName</key><string>Internal SSD</string>
+            <key>IORegistryEntryID</key><integer>4000</integer>
+            <key>Size</key><integer>4000000000000</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><false/><key>Ejectable</key><false/></dict>
+            <dict><key>BSD Name</key><string>disk21</string>
+            <key>IORegistryEntryName</key><string>Apple SDXC Reader Media</string>
+            <key>IORegistryEntryID</key><integer>4242</integer>
+            <key>Size</key><integer>63864569856</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/></dict>
+            <dict><key>BSD Name</key><string>disk21s1</string>
+            <key>IORegistryEntryID</key><integer>4243</integer>
+            <key>Size</key><integer>268435456</integer>
+            <key>Whole</key><false/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/></dict>
+            <dict><key>BSD Name</key><string>disk4</string>
+            <key>IORegistryEntryName</key><string>Writable disk image</string>
+            <key>IORegistryEntryID</key><integer>4444</integer>
+            <key>Size</key><integer>1000000000</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/></dict>
+            </array></plist>"#;
+            let registry_entries = parse_ioreg(registry_document).unwrap();
+            let diskutil_document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><dict><key>AllDisksAndPartitions</key><array>
+            <dict><key>DeviceIdentifier</key><string>disk0</string>
+            <key>Size</key><integer>4000000000000</integer></dict>
+            <dict><key>DeviceIdentifier</key><string>disk21</string>
+            <key>Size</key><integer>63864569856</integer></dict>
+            </array></dict></plist>"#;
+            let drives = parse_diskutil(diskutil_document, &registry_entries).unwrap();
             assert_eq!(drives.len(), 1);
-            assert_eq!(drives[0].device, "/dev/disk7");
-            assert_eq!(drives[0].id, "disk7@4242");
-            assert_eq!(drives[0].name, "SD Card Reader");
+            assert_eq!(drives[0].device, "/dev/disk21");
+            assert_eq!(drives[0].id, "disk21@4242");
+            assert_eq!(drives[0].name, "Apple SDXC Reader Media");
+            assert_eq!(drives[0].capacity, 63_864_569_856);
         }
 
         #[test]
-        fn parses_whole_media_registry_identity() {
+        fn missing_media_safety_flag_fails_closed() {
             let document = br#"<?xml version="1.0" encoding="UTF-8"?>
             <plist version="1.0"><array>
             <dict><key>BSD Name</key><string>disk7</string>
             <key>IORegistryEntryID</key><integer>4242</integer>
-            <key>Whole</key><true/></dict>
-            <dict><key>BSD Name</key><string>disk7s1</string>
-            <key>IORegistryEntryID</key><integer>4243</integer>
-            <key>Whole</key><false/></dict>
+            <key>Size</key><integer>31900000000</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/></dict>
             </array></plist>"#;
             let identities = parse_ioreg(document).unwrap();
-            assert_eq!(identities, BTreeMap::from([("disk7".to_owned(), 4_242)]));
+            assert!(identities.is_empty());
             assert_eq!(
                 split_stable_identifier("disk7@4242"),
                 Some(("disk7", 4_242))
             );
             assert_eq!(split_stable_identifier("disk7s1@4242"), None);
+        }
+
+        #[test]
+        fn rejects_diskutil_and_registry_size_mismatch() {
+            let registry_entries = BTreeMap::from([(
+                "disk7".to_owned(),
+                SafeMedia {
+                    registry_entry_id: 4_242,
+                    name: None,
+                    size: 31_900_000_000,
+                },
+            )]);
+            let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><dict><key>AllDisksAndPartitions</key><array><dict>
+            <key>DeviceIdentifier</key><string>disk7</string>
+            <key>Size</key><integer>31900000001</integer>
+            </dict></array></dict></plist>"#;
+            assert!(matches!(
+                parse_diskutil(document, &registry_entries),
+                Err(DriveError::InvalidData(message)) if message.contains("size mismatch")
+            ));
+        }
+
+        #[test]
+        fn duplicate_registry_entry_id_is_rejected() {
+            let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><array>
+            <dict><key>BSD Name</key><string>disk7</string>
+            <key>IORegistryEntryID</key><integer>4242</integer>
+            <key>Size</key><integer>31900000000</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/></dict>
+            <dict><key>BSD Name</key><string>disk8</string>
+            <key>IORegistryEntryID</key><integer>4242</integer>
+            <key>Size</key><integer>31900000000</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/></dict>
+            </array></plist>"#;
+            assert!(matches!(
+                parse_ioreg(document),
+                Err(DriveError::InvalidData(message)) if message.contains("duplicate I/O Registry entry ID")
+            ));
         }
 
         #[test]

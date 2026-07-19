@@ -90,7 +90,7 @@ impl OperationPhase {
                 "Rechecking the prepared image before the selected drive is accessed."
             }
             Self::ValidatingTarget => {
-                "Confirming that the same external physical drive is still connected."
+                "Confirming that the same removable physical drive is still connected."
             }
             Self::Unmounting => "Closing mounted volumes before raw-device access.",
             Self::Writing => "Do not remove the SD card. Cancelling now can leave it incomplete.",
@@ -452,7 +452,7 @@ impl SnapDogInstallerApp {
             } else {
                 let status = if ready {
                     self.drive_status.as_deref().unwrap_or(
-                        "Only external physical drives are shown. System drives are excluded.",
+                        "Only removable physical drives are shown. System drives are excluded.",
                     )
                 } else {
                     "Choose an image first"
@@ -680,7 +680,7 @@ impl SnapDogInstallerApp {
             ui.heading("Choose the SD card");
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Only external physical drives are listed. The selected drive will be completely erased.")
+                RichText::new("Only removable physical drives are listed. The selected drive will be completely erased.")
                     .color(MUTED),
             );
             ui.add_space(14.0);

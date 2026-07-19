@@ -155,7 +155,7 @@ pub enum WorkerError {
     TargetMissing,
     #[error("the selected target changed after selection")]
     TargetChanged,
-    #[error("the selected target is not a writable, whole external physical disk")]
+    #[error("the selected target is not a writable, whole removable physical disk")]
     UnsafeTarget,
     #[error("the flash operation was cancelled")]
     Cancelled,
@@ -238,7 +238,7 @@ pub fn run_macos_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashRe
         ProgressDestination::File { path } => Box::new(open_progress_file(path, &session)?),
     };
     let mut progress = JsonLineProgress::new(writer);
-    run_and_report(job, &mut macos::MacOsPlatform::default(), &mut progress)
+    run_and_report(job, &mut macos::MacOsPlatform, &mut progress)
 }
 
 #[cfg(target_os = "macos")]

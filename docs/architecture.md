@@ -30,13 +30,16 @@ and hashes for both representations while retaining the v1 fields used by existi
 ## Target safety
 
 - Exactly one whole physical drive can be selected.
-- macOS queries only `diskutil list -plist external physical` results.
+- macOS intersects `diskutil list -plist physical` results with I/O Registry media marked exactly
+  whole, writable, removable, and ejectable. This includes Apple's built-in SDXC reader while
+  excluding internal fixed disks and virtual disk images.
 - Linux queries removable whole devices in `/sys/block`.
 - Windows queries USB/SD disks and rejects `IsBoot` and `IsSystem` disks.
 - Device identifiers are syntax-checked before they can cross the worker boundary.
 - macOS carries the whole-media `IORegistryEntryID` captured at selection into the worker, then
-  re-enumerates immediately before writing and after opening the raw descriptor. Device path,
-  capacity, I/O Registry identity, media identity, and physical/external safety flags must match.
+  repeats the independent `diskutil`/I/O Registry intersection immediately before writing and after
+  opening the raw descriptor. Device path, capacity, I/O Registry identity, and every removable
+  physical-media safety flag must match.
 - Cancellation is checked between every buffered read/write operation.
 - Once a target has been unmounted, all failure and cancellation paths attempt a safe eject.
 - Closing the GUI during an operation requests a safe stop and waits for the worker to finish.
