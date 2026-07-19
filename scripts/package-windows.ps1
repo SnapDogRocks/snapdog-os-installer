@@ -44,7 +44,7 @@ try {
         throw "Packaged executable is empty: $TemporaryOutput"
     }
 
-    $Dumpbin = Get-Command 'dumpbin.exe' -CommandType Application -ErrorAction Stop
+    $Dumpbin = @(Get-Command 'dumpbin.exe' -CommandType Application -ErrorAction Stop)[0]
     $DependenciesOutput = & $Dumpbin.Source /nologo /dependents $File.FullName 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
         throw "dumpbin dependency inspection failed for $Output.`n$DependenciesOutput"
