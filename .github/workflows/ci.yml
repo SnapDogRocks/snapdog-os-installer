@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTFLAGS: -Dwarnings
+  RUST_VERSION: 1.88.0
+
+jobs:
+  lint-test:
+    name: Strict lint, test, policy, and packaging validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Linux build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes --no-install-recommends
+          appstream desktop-file-utils libasound2-dev libudev-dev libwayland-dev libx11-xcb-dev
+          libxkbcommon-dev libxkbcommon-x11-dev libxcursor-dev libxi-dev
+          libxrandr-dev pkg-config shellcheck
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Cache security tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-about
+            ~/.cargo/bin/cargo-deny
+          key: security-tools-about-0.9.0-audit-0.22.2-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
+      - name: Install security tools
+        run: |
+          command -v cargo-about >/dev/null || cargo install --locked --version 0.9.0 cargo-about
+          command -v cargo-audit >/dev/null || cargo install --locked --version 0.22.2 cargo-audit
+          command -v cargo-deny >/dev/null || cargo install --locked --version 0.20.2 cargo-deny
+      - name: Install pinned actionlint
+        run: |
+          install_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$install_dir"
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$install_dir" actionlint
+          echo "$install_dir" >> "$GITHUB_PATH"
+      - name: Run repository checks
+        run: ./scripts/check.sh
+
+  tests:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+          - os: windows-2025
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run strict platform checks
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+
+  linux-packages:
+    name: Linux AppImage (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            smoke_image: ubuntu@sha256:0d779ea97881505f5ef0039336ee85edba27519bdba968c284c86ee066a973c8
+            smoke_platform: linux/amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            smoke_image: ubuntu@sha256:ecd3706b6b5587d1318e1777359b8563f9db6e8e5a81841f04dc3c7edbefbdc1
+            smoke_platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build portable AppImage in pinned GLIBC 2.28 container
+        run: ./scripts/package-linux.sh --container "${{ matrix.target }}"
+      - name: Smoke-test AppImage in clean Ubuntu 22.04
+        run: |
+          docker run --rm --platform '${{ matrix.smoke_platform }}' \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            '${{ matrix.smoke_image }}' bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update >/dev/null
+              apt-get install --yes --no-install-recommends \
+                binutils ca-certificates libegl1 libgl1-mesa-dri xauth xvfb >/dev/null
+              ./packaging/linux/smoke-test-appimage.sh dist/*.AppImage
+            '
+      - name: Upload CI package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-linux-${{ matrix.arch }}
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 2
+
+  windows-packages:
+    name: Windows executable (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+            vs_component: Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+            vs_component: Microsoft.VisualStudio.Component.VC.Tools.ARM64
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust target
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
+          rustup default $env:RUST_VERSION
+          rustup target add '${{ matrix.target }}'
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+      - name: Run strict target checks and build executable
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-Dwarnings -C target-feature=+crt-static'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires '${{ matrix.vs_component }}' -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found.' }
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch '${{ matrix.msvc_arch }}' -HostArch amd64 -SkipAutomaticLocation
+          cargo clippy --locked --target '${{ matrix.target }}' --all-targets --all-features -- -D warnings
+          cargo check --locked --target '${{ matrix.target }}' --all-targets --all-features
+          if ('${{ matrix.arch }}' -eq 'x86_64') { cargo test --locked --all-features }
+          ./scripts/package-windows.ps1 -Target '${{ matrix.target }}'
+      - name: Upload CI package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-windows-${{ matrix.arch }}
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 2
+
+  macos-universal:
+    name: macOS universal compile
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust targets
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: macos-universal
+      - name: Compile both architectures
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings
+          cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/snapdog-os-installer \
+            target/x86_64-apple-darwin/release/snapdog-os-installer \
+            -output "$RUNNER_TEMP/snapdog-os-installer"
+          test "$(lipo -archs "$RUNNER_TEMP/snapdog-os-installer")" = "x86_64 arm64" || \
+            test "$(lipo -archs "$RUNNER_TEMP/snapdog-os-installer")" = "arm64 x86_64"

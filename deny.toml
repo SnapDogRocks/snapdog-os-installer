@@ -1,0 +1,63 @@
+# cargo-deny 0.20 policy for every platform shipped by SnapDog OS Installer.
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-pc-windows-msvc",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Security advisories and yanked crates are release blockers. These two
+# upstream GUI/font dependencies are explicitly accepted because neither has a
+# safe upgrade in the resolved egui/wgpu graph; both are unmaintained notices,
+# not reported vulnerabilities. Remove each waiver as soon as upstream does.
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "wgpu 27 pulls paste through metal; no safe compatible upgrade is available" },
+  { id = "RUSTSEC-2026-0192", reason = "egui 0.33 pulls ttf-parser through ab_glyph; no safe compatible upgrade is available" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+# Deliberately restricted to permissive licenses used by the resolved graph.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = [
+  { allow = ["GPL-3.0-only"], crate = "snapdog-os-installer" },
+]
+
+[bans]
+# GUI/platform stacks legitimately carry parallel major versions. Keep the
+# duplicates visible without making routine upstream convergence impossible.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

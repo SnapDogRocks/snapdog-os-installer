@@ -25,6 +25,14 @@ use crate::worker::{
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacOsWorkerRunner;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::LinuxWorkerRunner;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsWorkerRunner;
 
 /// Command-line switch used to re-enter this executable as the privileged worker.
 pub const WORKER_JOB_ARGUMENT: &str = "--worker-job";

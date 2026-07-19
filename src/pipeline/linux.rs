@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! macOS elevation and progress monitoring for the privileged worker.
+//! Linux elevation and progress monitoring for the privileged worker.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
@@ -23,99 +23,167 @@ const MAX_PROGRESS_READ: u64 = 1024 * 1024;
 const MAX_PROGRESS_RECORD: usize = 64 * 1024;
 const MAX_HELPER_STDERR: u64 = 256 * 1024;
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
-const WORKER_REQUIREMENT: &str = r#"identifier "cc.snapdog.os-installer" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "898G35U5LW""#;
-const WORKER_RELATIVE_PATH: &str = "Contents/MacOS/snapdog-os-installer";
-const ELEVATED_SHELL_PROGRAM: &str = r#"set -eu
-source_bundle=$1
-worker_argument=$2
-job_path=$3
-job_sha256_argument=$4
-expected_job_sha256=$5
-expected_executable_sha256=$6
-requirement=$7
-if [ "$worker_argument" != "--worker-job" ] ||
-   [ "$job_sha256_argument" != "--worker-job-sha256" ] ||
-   [ "${#expected_job_sha256}" -ne 64 ] ||
-   [ "${#expected_executable_sha256}" -ne 64 ]; then
-  echo 'Invalid SnapDog worker argument contract' >&2
+const O_NOFOLLOW: i32 = 0o400_000;
+const PKEXEC_CANDIDATES: &[&str] = &["/usr/bin/pkexec", "/bin/pkexec"];
+const BASH_CANDIDATES: &[&str] = &["/usr/bin/bash", "/bin/bash"];
+const INSTALL_CANDIDATES: &[&str] = &["/usr/bin/install", "/bin/install"];
+const MKTEMP_CANDIDATES: &[&str] = &["/usr/bin/mktemp", "/bin/mktemp"];
+const SHA256SUM_CANDIDATES: &[&str] = &["/usr/bin/sha256sum", "/bin/sha256sum"];
+const REMOVE_CANDIDATES: &[&str] = &["/usr/bin/rm", "/bin/rm"];
+const APPIMAGE_ENVIRONMENT: &str = "APPIMAGE";
+const APPDIR_ENVIRONMENT: &str = "APPDIR";
+
+// Dynamic values reach this constant program only as positional arguments. The root shell copies
+// the user-owned executable into a private root-owned directory and verifies the copy against the
+// digest of the descriptor pinned before PolicyKit authorization. This closes the interactive
+// prompt TOCTOU without installing a second SnapDog binary.
+const ROOT_LAUNCH_PROGRAM: &str = r#"
+set -euo pipefail
+if [[ $# -ne 10 ]]; then
+  echo 'invalid SnapDog root-launch argument count' >&2
   exit 64
 fi
-worker_root=$(/usr/bin/mktemp -d /private/tmp/snapdog-installer-worker.XXXXXX)
-trap '/bin/rm -rf "$worker_root"' EXIT HUP INT TERM
-worker_bundle="$worker_root/worker.app"
-/usr/bin/ditto --noqtn "$source_bundle" "$worker_bundle"
-/usr/sbin/chown -R root:wheel "$worker_bundle"
-/usr/bin/codesign --verify --deep --strict "-R=$requirement" "$worker_bundle"
-worker_executable="$worker_bundle/Contents/MacOS/snapdog-os-installer"
-actual_executable_sha256=$(/usr/bin/shasum -a 256 "$worker_executable")
+
+install_tool=$1
+mktemp_tool=$2
+sha256sum_tool=$3
+remove_tool=$4
+source_executable=$5
+expected_executable_sha256=$6
+worker_job_argument=$7
+job_path=$8
+worker_job_sha256_argument=$9
+expected_job_sha256=${10}
+root_directory=
+
+if [[ $worker_job_argument != --worker-job ||
+      $worker_job_sha256_argument != --worker-job-sha256 ]]; then
+  echo 'invalid SnapDog worker argument contract' >&2
+  exit 64
+fi
+
+cleanup() {
+  if [[ -n ${root_directory:-} ]]; then
+    "$remove_tool" -rf -- "$root_directory"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+umask 077
+root_directory=$("$mktemp_tool" -d /tmp/snapdog-os-installer-root.XXXXXXXXXX)
+"$install_tool" -d -m 0700 -- "$root_directory"
+root_executable=$root_directory/snapdog-os-installer
+"$install_tool" -m 0500 -- "$source_executable" "$root_executable"
+
+actual_executable_sha256=$("$sha256sum_tool" -- "$root_executable")
 actual_executable_sha256=${actual_executable_sha256%% *}
-if [ "$actual_executable_sha256" != "$expected_executable_sha256" ]; then
-  echo 'SnapDog executable changed during administrator authorization' >&2
+if [[ $actual_executable_sha256 != "$expected_executable_sha256" ]]; then
+  echo 'SnapDog executable changed during PolicyKit authorization' >&2
   exit 1
 fi
-/usr/bin/env SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE=YES-I-UNDERSTAND \
-  "$worker_executable" "$worker_argument" "$job_path" \
-  "$job_sha256_argument" "$expected_job_sha256"
-"#;
-// Values originating outside this source file are passed in argv and quoted by AppleScript.
-// Never interpolate a path into this program text.
-const ELEVATION_SCRIPT: &str = r#"
-on run argv
-    if (count of argv) is not 8 then error "Invalid worker launch arguments"
-    set bundlePath to item 1 of argv
-    set workerArgument to item 2 of argv
-    set jobPath to item 3 of argv
-    set jobSha256Argument to item 4 of argv
-    set expectedJobSha256 to item 5 of argv
-    set expectedExecutableSha256 to item 6 of argv
-    set shellProgram to item 7 of argv
-    set requirement to item 8 of argv
-    set shellCommand to "/bin/sh -c " & quoted form of shellProgram & " -- " & quoted form of bundlePath & " " & quoted form of workerArgument & " " & quoted form of jobPath & " " & quoted form of jobSha256Argument & " " & quoted form of expectedJobSha256 & " " & quoted form of expectedExecutableSha256 & " " & quoted form of requirement
-    do shell script shellCommand with administrator privileges
-end run
+
+set +e
+APPIMAGE_EXTRACT_AND_RUN=1 "$root_executable" \
+  "$worker_job_argument" "$job_path" \
+  "$worker_job_sha256_argument" "$expected_job_sha256"
+status=$?
+set -e
+exit "$status"
 "#;
 
-/// Launches the current application binary as a root worker through the native macOS prompt.
+/// Launches this executable as a root worker through `PolicyKit`'s native authorization prompt.
 #[derive(Clone, Debug)]
-pub struct MacOsWorkerRunner {
-    bundle: PathBuf,
+pub struct LinuxWorkerRunner {
+    executable: PathBuf,
+    pkexec: PathBuf,
+    helpers: TrustedHelpers,
 }
 
-impl MacOsWorkerRunner {
-    /// Use the currently running executable for the privileged worker re-entry.
+impl LinuxWorkerRunner {
+    /// Use the currently running executable for privileged worker re-entry.
     pub fn current() -> Result<Self, WorkerRunnerError> {
-        let executable = std::env::current_exe()?;
-        let bundle = bundle_for_executable(&executable)?;
-        verify_signed_bundle(&bundle)?;
-        Ok(Self { bundle })
+        let executable = worker_executable()?;
+        validate_executable(&executable)?;
+        let pkexec = find_pkexec()?;
+        let helpers = TrustedHelpers::find()?;
+        Ok(Self {
+            executable,
+            pkexec,
+            helpers,
+        })
     }
 
-    /// Use an explicit signed application bundle.
+    /// Use explicit executable and `pkexec` paths.
     ///
-    /// This is primarily useful for integration tests and packaged-app launch plumbing.
-    pub const fn with_bundle(bundle: PathBuf) -> Self {
-        Self { bundle }
+    /// This constructor is intended for packaged-launch plumbing and integration tests. Both paths
+    /// are still validated before every launch.
+    pub fn with_paths(executable: PathBuf, pkexec: PathBuf) -> Self {
+        Self {
+            executable,
+            pkexec,
+            helpers: TrustedHelpers::standard_paths(),
+        }
     }
 }
 
-impl WorkerRunner for MacOsWorkerRunner {
+fn worker_executable() -> Result<PathBuf, WorkerRunnerError> {
+    let current = std::env::current_exe()?;
+    match (
+        std::env::var_os(APPIMAGE_ENVIRONMENT),
+        std::env::var_os(APPDIR_ENVIRONMENT),
+    ) {
+        (None, None) => Ok(current),
+        (Some(appimage), Some(appdir)) => {
+            let appimage = PathBuf::from(appimage);
+            let appdir = PathBuf::from(appdir);
+            if !appimage.is_absolute()
+                || !appdir.is_absolute()
+                || !current.starts_with(&appdir)
+                || appimage.starts_with(&appdir)
+            {
+                return Err(WorkerRunnerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "inconsistent AppImage runtime paths",
+                )));
+            }
+            // The outer AppImage creates a fresh root-visible mount after PolicyKit approval;
+            // current_exe itself lives in the user's FUSE mount and is not traversable by root.
+            Ok(appimage)
+        }
+        _ => Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "incomplete AppImage runtime environment",
+        ))),
+    }
+}
+
+impl WorkerRunner for LinuxWorkerRunner {
     fn run(
         &self,
         launch: WorkerLaunch<'_>,
         progress: &mut dyn FnMut(WorkerProgress),
     ) -> Result<(), WorkerRunnerError> {
-        let executable = self.bundle.join(WORKER_RELATIVE_PATH);
-        let pinned = PinnedLaunchFiles::open(&executable, launch.job_path)?;
+        validate_executable(&self.executable)?;
+        validate_pkexec(&self.pkexec)?;
+        self.helpers.validate()?;
+        let pinned = PinnedLaunchFiles::open(&self.executable, launch.job_path)?;
         let launch_identity = pinned.identity;
         let mut tail = ProgressTail::open(launch.progress_path)?;
-        let mut process = ElevatedProcess::spawn(&self.bundle, launch.job_path, pinned)?;
+        let mut process = ElevatedProcess::spawn(
+            &self.pkexec,
+            &self.executable,
+            launch.job_path,
+            &self.helpers,
+            pinned,
+        )?;
         let mut monitor_error = None;
         let mut cancellation_sent = false;
 
         loop {
             if monitor_error.is_none()
                 && !tail.saw_event()
-                && let Err(error) = launch_identity.ensure_unchanged(&executable, launch.job_path)
+                && let Err(error) =
+                    launch_identity.ensure_unchanged(&self.executable, launch.job_path)
             {
                 let _ = touch_marker(launch.cancel_path);
                 let _ = process.request_stop();
@@ -138,10 +206,9 @@ impl WorkerRunner for MacOsWorkerRunner {
                 {
                     monitor_error = Some(WorkerRunnerError::Io(error));
                 }
-                // Before the worker emits its first event, the only process we can be waiting on
-                // is normally the macOS authorization dialog. Killing osascript dismisses that
-                // dialog. If startup raced, the already-created marker makes the worker stop at
-                // its first safe boundary while this runner still waits for process completion.
+                // Before the first worker event, pkexec is normally waiting for PolicyKit. Stop
+                // it to dismiss that prompt. If authorization raced, the marker makes the root
+                // worker stop at its next safe boundary and this runner continues monitoring it.
                 if !tail.saw_event()
                     && let Err(error) = process.request_stop()
                     && monitor_error.is_none()
@@ -186,12 +253,42 @@ impl WorkerRunner for MacOsWorkerRunner {
     }
 }
 
-fn stderr_message(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_owned();
-    if message.is_empty() {
-        "the macOS authorization helper returned no error details".to_owned()
-    } else {
-        message
+#[derive(Clone, Debug)]
+struct TrustedHelpers {
+    shell: PathBuf,
+    install: PathBuf,
+    mktemp: PathBuf,
+    sha256sum: PathBuf,
+    remove: PathBuf,
+}
+
+impl TrustedHelpers {
+    fn find() -> Result<Self, WorkerRunnerError> {
+        Ok(Self {
+            shell: find_trusted_helper(BASH_CANDIDATES, "bash")?,
+            install: find_trusted_helper(INSTALL_CANDIDATES, "install")?,
+            mktemp: find_trusted_helper(MKTEMP_CANDIDATES, "mktemp")?,
+            sha256sum: find_trusted_helper(SHA256SUM_CANDIDATES, "sha256sum")?,
+            remove: find_trusted_helper(REMOVE_CANDIDATES, "rm")?,
+        })
+    }
+
+    fn standard_paths() -> Self {
+        Self {
+            shell: PathBuf::from(BASH_CANDIDATES[0]),
+            install: PathBuf::from(INSTALL_CANDIDATES[0]),
+            mktemp: PathBuf::from(MKTEMP_CANDIDATES[0]),
+            sha256sum: PathBuf::from(SHA256SUM_CANDIDATES[0]),
+            remove: PathBuf::from(REMOVE_CANDIDATES[0]),
+        }
+    }
+
+    fn validate(&self) -> Result<(), WorkerRunnerError> {
+        validate_trusted_helper(&self.shell, "bash")?;
+        validate_trusted_helper(&self.install, "install")?;
+        validate_trusted_helper(&self.mktemp, "mktemp")?;
+        validate_trusted_helper(&self.sha256sum, "sha256sum")?;
+        validate_trusted_helper(&self.remove, "rm")
     }
 }
 
@@ -241,7 +338,10 @@ fn pin_and_hash(
     validate_launch_file_metadata(&before, maximum_size, require_executable)?;
     let before_identity = FileIdentity::from_metadata(&before);
 
-    let mut file = File::open(path)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)?;
     let opened = file.metadata()?;
     validate_launch_file_metadata(&opened, maximum_size, require_executable)?;
     if FileIdentity::from_metadata(&opened) != before_identity {
@@ -288,12 +388,12 @@ fn validate_launch_file_metadata(
         || !metadata.is_file()
         || metadata.len() == 0
         || maximum_size.is_some_and(|maximum| metadata.len() > maximum)
-        || require_executable && metadata.mode() & 0o111 == 0
+        || (require_executable && metadata.mode() & 0o111 == 0)
         || metadata.mode() & 0o022 != 0
     {
         return Err(WorkerRunnerError::Io(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "launch file has unsafe type, size, or mode",
+            "launch file has unsafe type, size, ownership mode, or executable mode",
         )));
     }
     Ok(())
@@ -341,7 +441,7 @@ impl FileIdentity {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(WorkerRunnerError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "launch file must remain a non-symlink regular file",
+                "privileged executable must be a non-symlink regular file",
             )));
         }
         Ok(Self::from_metadata(&metadata))
@@ -352,9 +452,98 @@ impl FileIdentity {
             Ok(())
         } else {
             Err(WorkerRunnerError::Io(io::Error::other(
-                "launch file changed during administrator authorization",
+                "pinned launch file changed during worker launch",
             )))
         }
+    }
+}
+
+fn find_pkexec() -> Result<PathBuf, WorkerRunnerError> {
+    let path = find_trusted_helper(PKEXEC_CANDIDATES, "pkexec").map_err(|error| match error {
+        WorkerRunnerError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            WorkerRunnerError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "pkexec is required for privileged SD-card writing; install PolicyKit/polkit",
+            ))
+        }
+        other => other,
+    })?;
+    validate_pkexec(&path)?;
+    Ok(path)
+}
+
+fn find_trusted_helper(candidates: &[&str], name: &str) -> Result<PathBuf, WorkerRunnerError> {
+    let path = candidates
+        .iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            WorkerRunnerError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("required privileged-launch helper `{name}` is unavailable"),
+            ))
+        })?;
+    validate_trusted_helper(&path, name)?;
+    Ok(path)
+}
+
+fn validate_pkexec(path: &Path) -> Result<(), WorkerRunnerError> {
+    validate_trusted_helper(path, "pkexec")
+}
+
+fn validate_trusted_helper(path: &Path, name: &str) -> Result<(), WorkerRunnerError> {
+    if !path.is_absolute() {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} path must be absolute"),
+        )));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{name} must be a non-symlink root-owned executable that is not group- or world-writable"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_executable(path: &Path) -> Result<(), WorkerRunnerError> {
+    if !path.is_absolute() {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker executable path must be absolute",
+        )));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker executable must be a non-symlink executable that is not group- or world-writable",
+        )));
+    }
+    Ok(())
+}
+
+fn stderr_message(stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr).trim().to_owned();
+    if message.is_empty() {
+        "PolicyKit authorization was denied or the privileged worker returned no details".to_owned()
+    } else {
+        message
     }
 }
 
@@ -366,31 +555,41 @@ struct ElevatedProcess {
 
 impl ElevatedProcess {
     fn spawn(
-        bundle: &Path,
+        pkexec: &Path,
+        executable: &Path,
         job_path: &Path,
+        helpers: &TrustedHelpers,
         pins: PinnedLaunchFiles,
     ) -> Result<Self, WorkerRunnerError> {
-        let mut child = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(ELEVATION_SCRIPT)
-            .arg("--")
-            .arg(bundle)
+        // Every dynamic value is a separate positional argument to a constant root program.
+        let mut child = Command::new(pkexec)
+            .arg(&helpers.shell)
+            .args(["--noprofile", "--norc", "-p", "-c", ROOT_LAUNCH_PROGRAM])
+            .arg("snapdog-root-launch")
+            .arg(&helpers.install)
+            .arg(&helpers.mktemp)
+            .arg(&helpers.sha256sum)
+            .arg(&helpers.remove)
+            .arg(executable)
+            .arg(&pins.executable_sha256)
             .arg(WORKER_JOB_ARGUMENT)
             .arg(job_path)
             .arg(WORKER_JOB_SHA256_ARGUMENT)
             .arg(&pins.job_sha256)
-            .arg(&pins.executable_sha256)
-            .arg(ELEVATED_SHELL_PROGRAM)
-            .arg(WORKER_REQUIREMENT)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
+        if let Err(error) = pins.identity.ensure_unchanged(executable, job_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let Some(mut stderr) = child.stderr.take() else {
             let _ = child.kill();
             let _ = child.wait();
             return Err(WorkerRunnerError::Io(io::Error::other(
-                "failed to capture osascript stderr",
+                "failed to capture pkexec stderr",
             )));
         };
         let stderr_reader = thread::spawn(move || {
@@ -545,56 +744,12 @@ impl ProgressTail {
     }
 }
 
-fn bundle_for_executable(executable: &Path) -> Result<PathBuf, WorkerRunnerError> {
-    let macos = executable.parent().ok_or_else(|| {
-        WorkerRunnerError::Io(io::Error::other("application executable has no parent"))
-    })?;
-    let contents = macos.parent().ok_or_else(|| {
-        WorkerRunnerError::Io(io::Error::other(
-            "application executable is not in a bundle",
-        ))
-    })?;
-    let bundle = contents.parent().ok_or_else(|| {
-        WorkerRunnerError::Io(io::Error::other(
-            "application executable is not in a bundle",
-        ))
-    })?;
-    if macos.file_name().is_none_or(|name| name != "MacOS")
-        || bundle
-            .extension()
-            .is_none_or(|extension| extension != "app")
-        || !bundle.join(WORKER_RELATIVE_PATH).is_file()
-    {
-        return Err(WorkerRunnerError::Io(io::Error::other(
-            "raw-device writing requires the signed SnapDog application bundle",
-        )));
-    }
-    Ok(bundle.to_path_buf())
-}
-
-fn verify_signed_bundle(bundle: &Path) -> Result<(), WorkerRunnerError> {
-    let output = Command::new("/usr/bin/codesign")
-        .arg("--verify")
-        .arg("--deep")
-        .arg("--strict")
-        .arg(format!("-R={WORKER_REQUIREMENT}"))
-        .arg(bundle)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(WorkerRunnerError::Failed {
-            status: output.status.to_string(),
-            message: stderr_message(&output.stderr),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
     use crate::worker::{WORKER_PROGRESS_SCHEMA_VERSION, WorkerPhase};
@@ -612,84 +767,73 @@ mod tests {
     }
 
     #[test]
-    fn elevation_script_quotes_every_dynamic_argument() {
-        assert!(ELEVATION_SCRIPT.contains("on run argv"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of bundlePath"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of workerArgument"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of jobPath"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of jobSha256Argument"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of expectedJobSha256"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of expectedExecutableSha256"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of shellProgram"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of requirement"));
-        assert!(ELEVATION_SCRIPT.contains("with administrator privileges"));
-        assert!(
-            ELEVATED_SHELL_PROGRAM
-                .contains("SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE=YES-I-UNDERSTAND")
+    fn explicit_paths_are_retained_without_command_construction() {
+        let runner = LinuxWorkerRunner::with_paths(
+            PathBuf::from("/opt/snapdog/snapdog-os-installer"),
+            PathBuf::from("/usr/bin/pkexec"),
         );
-        assert!(ELEVATED_SHELL_PROGRAM.contains("codesign --verify --deep --strict"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("\"-R=$requirement\""));
-        assert!(!ELEVATED_SHELL_PROGRAM.contains("--requirement"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("/usr/bin/shasum -a 256"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("$job_sha256_argument"));
-        assert!(!ELEVATION_SCRIPT.contains("$(touch /tmp/injected)"));
-    }
-
-    #[test]
-    fn pinned_launch_file_is_hashed_and_detects_mutation() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"pinned SnapDog job").unwrap();
-        file.flush().unwrap();
-        let pinned = pin_and_hash(file.path(), Some(MAX_WORKER_JOB_SIZE), false).unwrap();
-
         assert_eq!(
-            pinned.sha256,
-            hex::encode(Sha256::digest(b"pinned SnapDog job"))
+            runner.executable,
+            PathBuf::from("/opt/snapdog/snapdog-os-installer")
         );
-        fs::write(file.path(), b"replaced SnapDog job").unwrap();
-        assert!(pinned.identity.ensure_unchanged(file.path()).is_err());
+        assert_eq!(runner.pkexec, PathBuf::from("/usr/bin/pkexec"));
     }
 
     #[test]
-    fn elevation_programs_parse_without_execution() {
-        assert!(
-            Command::new("/bin/sh")
-                .args(["-n", "-c", ELEVATED_SHELL_PROGRAM])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let directory = tempdir().unwrap();
-        let compiled = directory.path().join("elevation.scpt");
-        let output = Command::new("/usr/bin/osacompile")
-            .arg("-e")
-            .arg(ELEVATION_SCRIPT)
-            .arg("-o")
-            .arg(compiled)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn executable_validation_rejects_relative_and_symlink_paths() {
+        assert!(validate_executable(Path::new("relative-worker")).is_err());
+        let directory = TempDir::new().unwrap();
+        let executable = directory.path().join("worker");
+        fs::write(&executable, b"binary").unwrap();
+        let link = directory.path().join("worker-link");
+        std::os::unix::fs::symlink(&executable, &link).unwrap();
+        assert!(validate_executable(&link).is_err());
     }
 
     #[test]
-    fn codesign_requirement_flag_rejects_a_false_designated_requirement() {
-        let status = Command::new("/usr/bin/codesign")
-            .args([
-                "--verify",
-                "--strict",
-                r#"-R=identifier "cc.snapdog.this-is-deliberately-false""#,
-                "/bin/ls",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
+    fn file_identity_detects_replacement() {
+        let directory = TempDir::new().unwrap();
+        let executable = directory.path().join("worker");
+        fs::write(&executable, b"first").unwrap();
+        let identity = FileIdentity::read(&executable).unwrap();
+        fs::remove_file(&executable).unwrap();
+        fs::write(&executable, b"second").unwrap();
+        assert!(identity.ensure_unchanged(&executable).is_err());
+    }
 
-        assert!(!status.success());
+    #[test]
+    fn launch_files_are_hashed_from_pinned_descriptors() {
+        let directory = TempDir::new().unwrap();
+        let executable = directory.path().join("installer");
+        let job = directory.path().join("worker-job.json");
+        fs::write(&executable, b"trusted executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&job, b"{\"schema_version\":1}").unwrap();
+        fs::set_permissions(&job, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let pinned = PinnedLaunchFiles::open(&executable, &job).unwrap();
+        assert_eq!(
+            pinned.executable_sha256,
+            hex::encode(Sha256::digest(b"trusted executable"))
+        );
+        assert_eq!(
+            pinned.job_sha256,
+            hex::encode(Sha256::digest(b"{\"schema_version\":1}"))
+        );
+
+        fs::write(&executable, b"replacement").unwrap();
+        assert!(pinned.identity.ensure_unchanged(&executable, &job).is_err());
+    }
+
+    #[test]
+    fn root_launch_program_has_a_fixed_copy_and_digest_boundary() {
+        assert!(ROOT_LAUNCH_PROGRAM.contains("install_tool=$1"));
+        assert!(ROOT_LAUNCH_PROGRAM.contains("-m 0500"));
+        assert!(ROOT_LAUNCH_PROGRAM.contains("actual_executable_sha256"));
+        assert!(ROOT_LAUNCH_PROGRAM.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
+        assert!(ROOT_LAUNCH_PROGRAM.contains("--worker-job-sha256"));
+        assert!(!ROOT_LAUNCH_PROGRAM.contains("eval"));
+        assert!(!ROOT_LAUNCH_PROGRAM.contains("source "));
     }
 
     #[test]
@@ -710,29 +854,26 @@ mod tests {
     }
 
     #[test]
-    fn progress_tail_rejects_schema_mismatch() {
-        let mut file = NamedTempFile::new().unwrap();
+    fn progress_tail_rejects_schema_mismatch_and_incomplete_record() {
+        let mut invalid_schema = NamedTempFile::new().unwrap();
         let mut progress = event(WorkerPhase::Writing);
         progress.schema_version += 1;
-        serde_json::to_writer(&mut file, &progress).unwrap();
-        file.write_all(b"\n").unwrap();
-        file.flush().unwrap();
+        serde_json::to_writer(&mut invalid_schema, &progress).unwrap();
+        invalid_schema.write_all(b"\n").unwrap();
+        invalid_schema.flush().unwrap();
+        let mut tail = ProgressTail::open(invalid_schema.path()).unwrap();
+        assert!(matches!(
+            tail.finish(&mut |_| {}),
+            Err(WorkerRunnerError::InvalidProgress(_))
+        ));
 
-        let mut tail = ProgressTail::open(file.path()).unwrap();
-        let error = tail.finish(&mut |_| {}).unwrap_err();
-
-        assert!(matches!(error, WorkerRunnerError::InvalidProgress(_)));
-    }
-
-    #[test]
-    fn progress_tail_rejects_incomplete_final_record() {
-        let mut file = NamedTempFile::new().unwrap();
-        serde_json::to_writer(&mut file, &event(WorkerPhase::Writing)).unwrap();
-        file.flush().unwrap();
-
-        let mut tail = ProgressTail::open(file.path()).unwrap();
-        let error = tail.finish(&mut |_| {}).unwrap_err();
-
-        assert!(matches!(error, WorkerRunnerError::InvalidProgress(_)));
+        let mut incomplete = NamedTempFile::new().unwrap();
+        serde_json::to_writer(&mut incomplete, &event(WorkerPhase::Writing)).unwrap();
+        incomplete.flush().unwrap();
+        let mut tail = ProgressTail::open(incomplete.path()).unwrap();
+        assert!(matches!(
+            tail.finish(&mut |_| {}),
+            Err(WorkerRunnerError::InvalidProgress(_))
+        ));
     }
 }

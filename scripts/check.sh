@@ -4,17 +4,123 @@ set -eu
 export RUSTFLAGS="-Dwarnings"
 
 cargo fmt --check
-cargo clippy --locked --all-targets --all-features
-cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
 cargo +1.88.0 check --locked --all-targets
+cargo deny check
+cargo audit
 
-if command -v cargo-audit >/dev/null 2>&1; then
-  cargo audit
-else
-  echo "cargo-audit is not installed; skipping dependency audit" >&2
+NOTICES=$(mktemp)
+trap 'rm -f "$NOTICES"' EXIT
+./scripts/generate-notices.sh "$NOTICES"
+if ! cmp -s THIRD_PARTY_NOTICES.txt "$NOTICES"; then
+  echo "THIRD_PARTY_NOTICES.txt is stale; run ./scripts/generate-notices.sh" >&2
+  exit 1
 fi
-if command -v cargo-deny >/dev/null 2>&1; then
-  cargo deny check
+
+shellcheck scripts/*.sh packaging/linux/*.sh
+actionlint
+if command -v desktop-file-validate >/dev/null 2>&1 &&
+  command -v appstreamcli >/dev/null 2>&1; then
+  desktop-file-validate packaging/linux/cc.snapdog.os-installer.desktop
+  appstreamcli validate --no-net packaging/linux/cc.snapdog.os-installer.appdata.xml
+elif [ "$(uname -s)" = Linux ]; then
+  echo "desktop-file-validate and appstreamcli are required on Linux" >&2
+  exit 1
 else
-  echo "cargo-deny is not installed; skipping policy check" >&2
+  echo "Skipping Linux desktop metadata validators on $(uname -s); CI enforces them on Linux"
 fi
+
+# Parse the Windows packager without executing it.
+# shellcheck disable=SC2016
+pwsh -NoLogo -NoProfile -NonInteractive -Command '
+  $tokens = $null
+  $errors = $null
+  [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path "scripts/package-windows.ps1"),
+    [ref]$tokens,
+    [ref]$errors
+  ) | Out-Null
+  if ($errors.Count -ne 0) {
+    $errors | ForEach-Object { Write-Error $_ }
+    exit 1
+  }
+'
+
+./scripts/check-live-manifests.py --self-test
+
+python3 - <<'PY'
+import plistlib
+import re
+import struct
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+root = Path.cwd()
+
+macos_pipeline = (root / "src/pipeline/macos.rs").read_text()
+runtime_requirement = re.search(
+    r'const WORKER_REQUIREMENT: &str = r#"(.*?)"#;', macos_pipeline
+)
+assert runtime_requirement is not None
+macos_packager = (root / "scripts/package-macos.sh").read_text()
+packaging_requirement = re.search(
+    r"^WORKER_REQUIREMENT='(.*)'$", macos_packager, re.MULTILINE
+)
+assert packaging_requirement is not None
+assert runtime_requirement.group(1) == packaging_requirement.group(1)
+assert '"-R=$requirement"' in macos_pipeline
+assert '.arg("--requirement")' not in macos_pipeline
+assert '"-R=$WORKER_REQUIREMENT"' in macos_packager
+assert "umask 077" in macos_packager
+assert "UNVALIDATED_DMG" in macos_packager
+assert 'mv -f "$UNVALIDATED_DMG" "$DMG"' in macos_packager
+
+build_script = (root / "build.rs").read_text()
+assert 'CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")' in build_script
+
+windows_packager = (root / "scripts/package-windows.ps1").read_text()
+static_windows_flags = "-Dwarnings -C target-feature=+crt-static"
+assert static_windows_flags in windows_packager
+assert "dumpbin.exe" in windows_packager
+assert "$TemporaryOutput" in windows_packager
+assert "Move-Item -Force -LiteralPath $TemporaryOutput -Destination $Output" in windows_packager
+for runtime_name in ("vcruntime", "msvcp", "msvcr", "concrt", "ucrtbase", "api-ms-win-crt-"):
+    assert runtime_name in windows_packager.lower()
+
+for workflow in ("ci.yml", "release.yml"):
+    workflow_text = (root / ".github/workflows" / workflow).read_text()
+    assert static_windows_flags in workflow_text
+
+info = plistlib.loads((root / "packaging/macos/Info.plist").read_bytes())
+assert info["CFBundleIdentifier"] == "cc.snapdog.os-installer"
+assert info["CFBundleExecutable"] == "snapdog-os-installer"
+assert info["CFBundleShortVersionString"] == "__VERSION__"
+assert info["CFBundleVersion"] == "__VERSION__"
+
+entitlements = plistlib.loads(
+    (root / "packaging/macos/entitlements.plist").read_bytes()
+)
+assert entitlements == {}
+
+component = ET.parse(
+    root / "packaging/linux/cc.snapdog.os-installer.appdata.xml"
+).getroot()
+assert component.tag == "component"
+assert component.findtext("id") == "cc.snapdog.os-installer"
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    data = path.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    return struct.unpack(">II", data[16:24])
+
+
+assert png_dimensions(root / "packaging/linux/cc.snapdog.os-installer.png") == (
+    512,
+    512,
+)
+assert png_dimensions(root / "assets/icon.png") == (1024, 1024)
+assert png_dimensions(root / "assets/dmg/background.png") == (600, 400)
+assert (root / "assets/icon.icns").read_bytes()[:4] == b"icns"
+assert (root / "assets/icon.ico").read_bytes()[:4] == b"\x00\x00\x01\x00"
+PY

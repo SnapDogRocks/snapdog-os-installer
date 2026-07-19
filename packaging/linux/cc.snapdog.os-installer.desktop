@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SnapDog OS Installer
+Comment=Download and write SnapDog OS images to SD cards
+Exec=snapdog-os-installer
+Icon=cc.snapdog.os-installer
+Terminal=false
+Categories=Utility;
+Keywords=SnapDog;Raspberry Pi;SD card;installer;
+StartupNotify=true
+StartupWMClass=cc.snapdog.os-installer

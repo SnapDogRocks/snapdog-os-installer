@@ -158,12 +158,57 @@ pub(crate) fn write_raw_from<T, F>(
     verify: bool,
     cancelled: &AtomicBool,
     skip_verification: &AtomicBool,
-    mut progress: F,
+    progress: F,
 ) -> Result<FlashReport, FlashError>
 where
     T: Read + Write + Seek,
     F: FnMut(FlashProgress),
 {
+    write_raw_from_with_prepare(
+        input,
+        target,
+        FlashWriteOptions {
+            target_capacity,
+            verify,
+            cancelled,
+            skip_verification,
+        },
+        progress,
+        |_| Ok(()),
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FlashWriteOptions<'a> {
+    pub(crate) target_capacity: u64,
+    pub(crate) verify: bool,
+    pub(crate) cancelled: &'a AtomicBool,
+    pub(crate) skip_verification: &'a AtomicBool,
+}
+
+/// Write from an open image and invoke a platform durability/cache barrier before readback.
+///
+/// The generic file-backed API above intentionally uses a no-op barrier for in-memory and test
+/// targets. Production raw-device workers must use this entry point and provide a barrier that
+/// makes subsequent reads reach the target rather than merely observing dirty write-cache pages.
+pub(crate) fn write_raw_from_with_prepare<T, F, P>(
+    input: &mut File,
+    target: &mut T,
+    options: FlashWriteOptions<'_>,
+    mut progress: F,
+    mut prepare_verification: P,
+) -> Result<FlashReport, FlashError>
+where
+    T: Read + Write + Seek,
+    F: FnMut(FlashProgress),
+    P: FnMut(&mut T) -> Result<(), FlashError>,
+{
+    let FlashWriteOptions {
+        target_capacity,
+        verify,
+        cancelled,
+        skip_verification,
+    } = options;
     let total = input.metadata()?.len();
     if total > target_capacity {
         return Err(FlashError::TargetTooSmall);
@@ -195,6 +240,17 @@ where
     let raw_digest = hasher.finalize();
     let raw_sha256 = hex::encode(raw_digest);
     let verified = if verify && !skip_verification.load(Ordering::Relaxed) {
+        // `flush` above only drains userspace buffers. Raw-device verification must not begin
+        // until the platform has forced the device write and invalidated any relevant read cache.
+        prepare_verification(target)?;
+        ensure_not_cancelled(cancelled)?;
+        if skip_verification.load(Ordering::Relaxed) {
+            return Ok(FlashReport {
+                bytes_written: written,
+                raw_sha256,
+                verified: false,
+            });
+        }
         target.seek(SeekFrom::Start(0))?;
         let mut read = 0_u64;
         let mut verify_hasher = Sha256::new();
@@ -364,6 +420,7 @@ impl Write for HashWriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::Cursor;
 
     use flate2::{Compression, write::GzEncoder};
@@ -555,5 +612,65 @@ mod tests {
 
         assert_eq!(report.bytes_written, original.len() as u64);
         assert_eq!(&target.into_inner()[..original.len()], original);
+    }
+
+    #[test]
+    fn production_barrier_runs_before_the_first_verification_read() {
+        let payload = b"durable readback".repeat(4096);
+        let raw = NamedTempFile::new().unwrap();
+        std::fs::write(raw.path(), &payload).unwrap();
+        let mut input = File::open(raw.path()).unwrap();
+        let mut target = Cursor::new(vec![0_u8; payload.len()]);
+        let barrier_ran = Cell::new(false);
+
+        let report = write_raw_from_with_prepare(
+            &mut input,
+            &mut target,
+            FlashWriteOptions {
+                target_capacity: payload.len() as u64,
+                verify: true,
+                cancelled: &AtomicBool::new(false),
+                skip_verification: &AtomicBool::new(false),
+            },
+            |update| {
+                if update.stage == FlashStage::Verifying {
+                    assert!(barrier_ran.get());
+                }
+            },
+            |_| {
+                barrier_ran.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(barrier_ran.get());
+        assert!(report.verified);
+    }
+
+    #[test]
+    fn failed_production_barrier_cannot_report_verified() {
+        let payload = b"unflushed readback";
+        let raw = NamedTempFile::new().unwrap();
+        std::fs::write(raw.path(), payload).unwrap();
+        let mut input = File::open(raw.path()).unwrap();
+        let mut target = Cursor::new(vec![0_u8; payload.len()]);
+        let mut saw_verification = false;
+
+        let result = write_raw_from_with_prepare(
+            &mut input,
+            &mut target,
+            FlashWriteOptions {
+                target_capacity: payload.len() as u64,
+                verify: true,
+                cancelled: &AtomicBool::new(false),
+                skip_verification: &AtomicBool::new(false),
+            },
+            |update| saw_verification |= update.stage == FlashStage::Verifying,
+            |_| Err(io::Error::other("durability barrier failed").into()),
+        );
+
+        assert!(matches!(result, Err(FlashError::Io(_))));
+        assert!(!saw_verification);
     }
 }

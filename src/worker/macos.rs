@@ -57,7 +57,9 @@ impl WorkerPlatform for MacOsPlatform {
     }
 
     fn unmount(&mut self, selected: &WorkerDrive) -> Result<(), WorkerError> {
-        diskutil(["unmountDisk", selected.device.as_str()]).map(|_| ())
+        compare_drive(selected, &self.validate_target(selected)?)?;
+        diskutil(["unmountDisk", selected.device.as_str()])?;
+        compare_drive(selected, &self.validate_target(selected)?)
     }
 
     fn open_target(
@@ -80,6 +82,9 @@ impl WorkerPlatform for MacOsPlatform {
     }
 
     fn eject(&mut self, selected: &WorkerDrive) -> Result<(), WorkerError> {
+        // Cleanup can run after a hot-unplug failure. Never apply `diskutil eject` to a new medium
+        // that inherited the selected BSD path after the original card disappeared.
+        compare_drive(selected, &self.validate_target(selected)?)?;
         diskutil(["eject", selected.device.as_str()]).map(|_| ())
     }
 }

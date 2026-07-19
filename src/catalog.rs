@@ -33,6 +33,7 @@ impl CatalogClient {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
+            .https_only(true)
             .user_agent(concat!("snapdog-os-installer/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { client })

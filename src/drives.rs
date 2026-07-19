@@ -339,8 +339,24 @@ mod platform {
             let entry = entry?;
             let id = entry.file_name().to_string_lossy().into_owned();
             let root = entry.path();
-            if !is_safe_id(&id) || read_trimmed(&root.join("removable"))? != "1" {
+            if !is_safe_id(&id)
+                || read_trimmed(&root.join("removable"))? != "1"
+                || read_trimmed(&root.join("ro"))? != "0"
+            {
                 continue;
+            }
+            let diskseq_text = read_trimmed(&root.join("diskseq")).map_err(|error| {
+                DriveError::InvalidData(format!(
+                    "Linux kernel 5.15 or newer is required for safe removable-drive identity: {error}"
+                ))
+            })?;
+            let diskseq = diskseq_text.parse::<u64>().map_err(|error| {
+                DriveError::InvalidData(format!("invalid kernel disk sequence number: {error}"))
+            })?;
+            if diskseq == 0 {
+                return Err(DriveError::InvalidData(
+                    "kernel returned an unsafe zero disk sequence number".to_owned(),
+                ));
             }
             let sectors = read_trimmed(&root.join("size"))?
                 .parse::<u64>()
@@ -356,7 +372,7 @@ mod platform {
             let name = format!("{vendor} {model}").trim().to_owned();
             drives.push(Drive {
                 device: format!("/dev/{id}"),
-                id,
+                id: format!("{id}@{diskseq}"),
                 name: if name.is_empty() {
                     "Removable drive".to_owned()
                 } else {
@@ -378,6 +394,7 @@ mod platform {
 
     fn is_safe_id(id: &str) -> bool {
         !id.is_empty()
+            && id.len() <= 128
             && id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
@@ -386,27 +403,165 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::process::Command;
+    use std::os::windows::process::CommandExt;
 
     use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
     use super::{Drive, DriveError};
+
+    const STABLE_ID_VERSION: &str = "windows-disk-v2";
+    const PHYSICAL_DRIVE_PREFIX: &str = r"\\.\PHYSICALDRIVE";
+    const MAX_POWERSHELL_OUTPUT: usize = 1024 * 1024;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const QUERY_DISKS_SCRIPT: &str = r"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$PSModuleAutoloadingPreference = 'None'
+$env:PSModulePath = ''
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
+Import-Module -Name $env:SNAPDOG_CIM_MODULE -Force -ErrorAction Stop
+$cimDisks = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop)
+$items = @(Get-Disk -ErrorAction Stop | ForEach-Object {
+    $disk = $_
+    $number = [uint32]$disk.Number
+    $cimMatches = @($cimDisks | Where-Object { [uint32]$_.Index -eq $number })
+    $supportsRemovableMedia = $false
+    if ($cimMatches.Count -eq 1) {
+        $supportsRemovableMedia = @($cimMatches[0].Capabilities) -contains [uint16]7
+    }
+    [pscustomobject]@{
+        Number = $number
+        FriendlyName = [string]$disk.FriendlyName
+        Path = [string]$disk.Path
+        UniqueId = [string]$disk.UniqueId
+        SerialNumber = [string]$disk.SerialNumber
+        Size = [uint64]$disk.Size
+        LogicalSectorSize = [uint32]$disk.LogicalSectorSize
+        PhysicalSectorSize = [uint32]$disk.PhysicalSectorSize
+        IsBoot = [bool]$disk.IsBoot
+        IsSystem = [bool]$disk.IsSystem
+        IsOffline = [bool]$disk.IsOffline
+        IsReadOnly = [bool]$disk.IsReadOnly
+        BusType = [string]$disk.BusType
+        SupportsRemovableMedia = [bool]$supportsRemovableMedia
+    }
+})
+ConvertTo-Json -InputObject $items -Compress
+";
+
+    #[derive(Clone, Copy, Deserialize)]
+    #[serde(transparent)]
+    struct BoolFlag(bool);
+
+    impl BoolFlag {
+        const fn is_set(self) -> bool {
+            self.0
+        }
+    }
 
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct WindowsDisk {
+        number: u32,
         friendly_name: String,
-        device_id: String,
+        path: String,
+        unique_id: String,
+        serial_number: String,
         size: u64,
-        is_boot: bool,
-        is_system: bool,
+        logical_sector_size: u32,
+        physical_sector_size: u32,
+        is_boot: BoolFlag,
+        is_system: BoolFlag,
+        is_offline: BoolFlag,
+        is_read_only: BoolFlag,
+        bus_type: String,
+        supports_removable_media: BoolFlag,
+    }
+
+    impl WindowsDisk {
+        fn normalize(&mut self) {
+            self.friendly_name = self.friendly_name.trim().to_owned();
+            self.path = self.path.trim().to_owned();
+            self.unique_id = self.unique_id.trim().to_owned();
+            self.serial_number = self.serial_number.trim().to_owned();
+            self.bus_type = self.bus_type.trim().to_ascii_uppercase();
+        }
+
+        fn safe_removable(&self) -> bool {
+            !self.is_boot.is_set()
+                && !self.is_system.is_set()
+                && !self.is_offline.is_set()
+                && !self.is_read_only.is_set()
+                && self.size > 0
+                && valid_sector_geometry(
+                    self.size,
+                    self.logical_sector_size,
+                    self.physical_sector_size,
+                )
+                && !self.path.is_empty()
+                && (!self.unique_id.is_empty() || !self.serial_number.is_empty())
+                && match self.bus_type.as_str() {
+                    // The storage bus itself is an unambiguous removable-card discriminator for
+                    // built-in SD/MMC readers. USB also carries ordinary external HDDs/SSDs, so
+                    // it requires Win32_DiskDrive capability 7 (supports removable media).
+                    "SD" | "MMC" => true,
+                    "USB" => self.supports_removable_media.is_set(),
+                    _ => false,
+                }
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            let number = self.number.to_string();
+            let size = self.size.to_string();
+            let logical_sector_size = self.logical_sector_size.to_string();
+            let physical_sector_size = self.physical_sector_size.to_string();
+            let supports_removable_media = self.supports_removable_media.is_set().to_string();
+            let mut digest = Sha256::new();
+            for field in [
+                STABLE_ID_VERSION.as_bytes(),
+                number.as_bytes(),
+                size.as_bytes(),
+                logical_sector_size.as_bytes(),
+                physical_sector_size.as_bytes(),
+                self.bus_type.as_bytes(),
+                self.path.as_bytes(),
+                self.unique_id.as_bytes(),
+                self.serial_number.as_bytes(),
+                supports_removable_media.as_bytes(),
+            ] {
+                let length = u64::try_from(field.len()).ok()?;
+                digest.update(length.to_le_bytes());
+                digest.update(field);
+            }
+            Some(hex::encode(digest.finalize()))
+        }
     }
 
     pub(super) fn removable_drives() -> Result<Vec<Drive>, DriveError> {
-        let script = "Get-Disk | Where-Object { -not $_.IsBoot -and -not $_.IsSystem -and ($_.BusType -eq 'USB' -or $_.BusType -eq 'SD') } | Select-Object FriendlyName,@{N='DeviceId';E={'\\\\.\\PHYSICALDRIVE'+$_.Number}},Size,IsBoot,IsSystem | ConvertTo-Json -Compress";
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        let mut command = crate::worker::windows_powershell_command()
+            .map_err(|error| DriveError::InvalidData(error.to_string()))?;
+        let output = command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                QUERY_DISKS_SCRIPT,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()?;
+        if output.stdout.len() > MAX_POWERSHELL_OUTPUT
+            || output.stderr.len() > MAX_POWERSHELL_OUTPUT
+        {
+            return Err(DriveError::InvalidData(
+                "Windows disk query output exceeded the safety limit".to_owned(),
+            ));
+        }
         if !output.status.success() {
             return Err(DriveError::InvalidData(
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -417,35 +572,98 @@ mod platform {
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
-        let values: serde_json::Value = serde_json::from_str(trimmed)
+        let mut disks: Vec<WindowsDisk> = serde_json::from_str(trimmed)
             .map_err(|error| DriveError::InvalidData(error.to_string()))?;
-        let disks = if values.is_array() {
-            serde_json::from_value::<Vec<WindowsDisk>>(values)
-        } else {
-            serde_json::from_value::<WindowsDisk>(values).map(|disk| vec![disk])
-        }
-        .map_err(|error| DriveError::InvalidData(error.to_string()))?;
-        Ok(disks
-            .into_iter()
-            .filter(|disk| {
-                !disk.is_boot
-                    && !disk.is_system
-                    && disk.size > 0
-                    && valid_device_id(&disk.device_id)
-            })
-            .map(|disk| Drive {
-                id: disk.device_id.clone(),
-                device: disk.device_id,
-                name: disk.friendly_name,
+        let mut drives = Vec::new();
+        for disk in &mut disks {
+            disk.normalize();
+            if !disk.safe_removable() {
+                continue;
+            }
+            let Some(fingerprint) = disk.fingerprint() else {
+                continue;
+            };
+            let device = format!("{PHYSICAL_DRIVE_PREFIX}{}", disk.number);
+            drives.push(Drive {
+                id: format!("{device}@{fingerprint}"),
+                device,
+                name: if disk.friendly_name.is_empty() {
+                    "Removable drive".to_owned()
+                } else {
+                    disk.friendly_name.clone()
+                },
                 capacity: disk.size,
-            })
-            .collect())
+            });
+        }
+        Ok(drives)
     }
 
-    fn valid_device_id(id: &str) -> bool {
-        id.strip_prefix(r"\\.\PHYSICALDRIVE").is_some_and(|suffix| {
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    fn valid_sector_geometry(size: u64, logical: u32, physical: u32) -> bool {
+        (512..=65_536).contains(&logical)
+            && logical.is_power_of_two()
+            && (logical..=65_536).contains(&physical)
+            && physical.is_power_of_two()
+            && size.is_multiple_of(u64::from(logical))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn disk(bus_type: &str, supports_removable_media: bool) -> WindowsDisk {
+            WindowsDisk {
+                number: 7,
+                friendly_name: "SnapDog test card".to_owned(),
+                path: r"\\?\usbstor#disk&ven_snapdog&prod_test".to_owned(),
+                unique_id: "MEDIA-1234".to_owned(),
+                serial_number: "SERIAL-5678".to_owned(),
+                size: 32_000_000_000,
+                logical_sector_size: 512,
+                physical_sector_size: 4_096,
+                is_boot: BoolFlag(false),
+                is_system: BoolFlag(false),
+                is_offline: BoolFlag(false),
+                is_read_only: BoolFlag(false),
+                bus_type: bus_type.to_owned(),
+                supports_removable_media: BoolFlag(supports_removable_media),
+            }
+        }
+
+        #[test]
+        fn excludes_ordinary_usb_fixed_media() {
+            assert!(!disk("USB", false).safe_removable());
+            assert!(disk("USB", true).safe_removable());
+        }
+
+        #[test]
+        fn preserves_native_sd_and_mmc_readers() {
+            assert!(disk("SD", false).safe_removable());
+            assert!(disk("MMC", false).safe_removable());
+        }
+
+        #[test]
+        fn rejects_ambiguous_or_unsupported_sector_geometry() {
+            let mut candidate = disk("SD", false);
+            candidate.logical_sector_size = 0;
+            assert!(!candidate.safe_removable());
+
+            let mut candidate = disk("SD", false);
+            candidate.physical_sector_size = 131_072;
+            assert!(!candidate.safe_removable());
+
+            let mut candidate = disk("SD", false);
+            candidate.size += 1;
+            assert!(!candidate.safe_removable());
+        }
+
+        #[test]
+        fn helper_uses_only_explicit_trusted_modules() {
+            assert!(QUERY_DISKS_SCRIPT.contains("SNAPDOG_STORAGE_MODULE"));
+            assert!(QUERY_DISKS_SCRIPT.contains("SNAPDOG_CIM_MODULE"));
+            assert!(QUERY_DISKS_SCRIPT.contains("$env:PSModulePath = ''"));
+            assert!(QUERY_DISKS_SCRIPT.contains("Capabilities) -contains [uint16]7"));
+            assert!(!QUERY_DISKS_SCRIPT.contains("Invoke-Expression"));
+        }
     }
 }
 

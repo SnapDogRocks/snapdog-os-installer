@@ -7,21 +7,21 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 
 use crate::catalog::CatalogClient;
-use crate::download::DownloadProgress;
+use crate::download::{DownloadClient, DownloadProgress};
 use crate::drives;
 use crate::flash::{FlashProgress, FlashStage};
 use crate::model::{Board, Channel, Drive, ImageSelection, Manifest};
 use crate::pipeline::{
-    PipelineControl, PipelineError, PipelineEvent, PipelineReport, PipelineRequest,
+    PipelineControl, PipelineError, PipelineEvent, PipelineReport, PipelineRequest, run_pipeline,
 };
 use crate::worker::{WorkerDrive, WorkerPhase, WorkerProgress};
 
-#[cfg(target_os = "macos")]
-use crate::download::DownloadClient;
+#[cfg(target_os = "linux")]
+use crate::pipeline::LinuxWorkerRunner;
 #[cfg(target_os = "macos")]
 use crate::pipeline::MacOsWorkerRunner;
-#[cfg(target_os = "macos")]
-use crate::pipeline::run_pipeline;
+#[cfg(target_os = "windows")]
+use crate::pipeline::WindowsWorkerRunner;
 
 const BACKGROUND: Color32 = Color32::from_rgb(28, 25, 23);
 const SURFACE: Color32 = Color32::from_rgb(38, 34, 31);
@@ -32,6 +32,7 @@ const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const TEXT: Color32 = Color32::from_rgb(242, 242, 242);
 const MUTED: Color32 = Color32::from_rgb(148, 144, 140);
 const DANGER: Color32 = Color32::from_rgb(255, 105, 97);
+const THIRD_PARTY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.txt");
 
 enum CatalogEvent {
     Loaded(Channel, Manifest),
@@ -68,7 +69,7 @@ impl OperationPhase {
         match self {
             Self::Downloading => "Downloading SnapDog OS…",
             Self::Decompressing => "Preparing the image…",
-            Self::Authorizing => "Waiting for macOS…",
+            Self::Authorizing => "Waiting for approval…",
             Self::ValidatingImage => "Checking the image…",
             Self::ValidatingTarget => "Checking the target…",
             Self::Unmounting => "Preparing the target…",
@@ -96,7 +97,7 @@ impl OperationPhase {
             Self::Writing => "Do not remove the SD card. Cancelling now can leave it incomplete.",
             Self::Verifying => "Reading the image back to detect faulty media or write errors.",
             Self::Syncing => "Flushing all buffered data to the SD card.",
-            Self::Ejecting => "Waiting until macOS reports that the card is safe to remove.",
+            Self::Ejecting => "Waiting until the system reports that the card is safe to remove.",
         }
     }
 
@@ -160,6 +161,7 @@ enum Overlay {
     EraseConfirmation,
     SkipConfirmation,
     Settings,
+    ThirdPartyNotices,
     CloseConfirmation,
 }
 
@@ -365,17 +367,7 @@ impl SnapDogInstallerApp {
             );
             ui.add_space(7.0);
 
-            let can_confirm = self.board.is_some() && self.selected_manifest().is_some();
-            let label = self.confirmed.as_ref().map_or_else(
-                || format!("Use SnapDog OS {version}"),
-                |selection| format!("SnapDog OS {} selected ✓", selection.manifest.version),
-            );
-            if ui
-                .add_enabled(can_confirm, primary_button(&label, Vec2::new(220.0, 40.0)))
-                .clicked()
-            {
-                self.confirm_selection();
-            }
+            self.release_confirmation(ui, &version);
 
             if self.channel == Channel::Beta {
                 ui.add_space(4.0);
@@ -392,6 +384,30 @@ impl SnapDogInstallerApp {
         });
     }
 
+    fn release_confirmation(&mut self, ui: &mut egui::Ui, version: &str) {
+        let release_error = self.board.and_then(|board| {
+            self.selected_manifest()
+                .and_then(|manifest| validate_release_image(manifest, board).err())
+        });
+        let can_confirm =
+            self.board.is_some() && self.selected_manifest().is_some() && release_error.is_none();
+        let label = self.confirmed.as_ref().map_or_else(
+            || format!("Use SnapDog OS {version}"),
+            |selection| format!("SnapDog OS {} selected ✓", selection.manifest.version),
+        );
+        if ui
+            .add_enabled(can_confirm, primary_button(&label, Vec2::new(220.0, 40.0)))
+            .clicked()
+        {
+            self.confirm_selection();
+        }
+
+        if let Some(error) = release_error {
+            ui.add_space(4.0);
+            ui.label(RichText::new(error).color(ORANGE).small());
+        }
+    }
+
     fn clear_image_dependants(&mut self) {
         self.confirmed = None;
         self.selected_drive = None;
@@ -403,6 +419,10 @@ impl SnapDogInstallerApp {
         let (Some(board), Some(manifest)) = (self.board, self.selected_manifest().cloned()) else {
             return;
         };
+        if let Err(error) = validate_release_image(&manifest, board) {
+            self.catalog_error = Some(error);
+            return;
+        }
         let Some(image) = manifest.image_for(board) else {
             self.catalog_error = Some(format!(
                 "SnapDog OS {} has no image for {}",
@@ -534,16 +554,18 @@ impl SnapDogInstallerApp {
             .selected_drive
             .as_ref()
             .ok_or_else(|| "Select a target first".to_owned())?;
-        if !cfg!(target_os = "macos") {
+        if !cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             return Err("Flashing is not available on this platform yet".to_owned());
         }
         let image = selection
             .manifest
             .image_for(selection.board)
             .ok_or_else(|| "Selected release has no image for this Raspberry Pi".to_owned())?;
-        if !supports_manifest_schema(selection.manifest.schema_version) || image.url.is_none() {
-            return Err("Release metadata is too old for safe flashing".to_owned());
-        }
+        validate_release_image(&selection.manifest, selection.board)?;
         let compressed_sha256 = required_hash(image.sha256.as_deref(), "compressed image")?;
         let raw_sha256 = required_hash(image.raw_sha256.as_deref(), "raw image")?;
         let compressed_size = required_size(image.compressed_size, "compressed image")?;
@@ -861,6 +883,7 @@ impl SnapDogInstallerApp {
     }
 
     fn show_settings(&mut self, context: &egui::Context) {
+        let mut show_notices = false;
         let response = branded_modal(context, "settings", |ui| {
             ui.set_width(420.0);
             ui.heading("Settings");
@@ -886,6 +909,16 @@ impl SnapDogInstallerApp {
                 });
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
+                ui.hyperlink_to(
+                    "Source & GPL-3.0 license",
+                    "https://github.com/SnapDogRocks/snapdog-os-installer",
+                );
+                if ui.link("Licenses & third-party notices").clicked() {
+                    show_notices = true;
+                }
+            });
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
                 if ui
                     .add(primary_button("Done", Vec2::new(180.0, 42.0)))
                     .clicked()
@@ -894,8 +927,56 @@ impl SnapDogInstallerApp {
                 }
             });
         });
-        if response.should_close() {
+        if show_notices {
+            self.overlay = Some(Overlay::ThirdPartyNotices);
+        } else if response.should_close() {
             self.overlay = None;
+        }
+    }
+
+    fn show_third_party_notices(&mut self, context: &egui::Context) {
+        let mut back = false;
+        let response = branded_modal(context, "third-party-notices", |ui| {
+            ui.set_width(680.0);
+            ui.heading("Open-source notices");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("License texts embedded from the locked release dependency graph.")
+                    .color(MUTED),
+            );
+            ui.add_space(10.0);
+            egui::Frame::new()
+                .fill(ELEVATED)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("third-party-notices-scroll")
+                        .max_height(460.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(THIRD_PARTY_NOTICES)
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(TEXT),
+                                )
+                                .wrap(),
+                            );
+                        });
+                });
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                if ui
+                    .add(primary_button("Back to Settings", Vec2::new(200.0, 42.0)))
+                    .clicked()
+                {
+                    back = true;
+                }
+            });
+        });
+        if back || response.should_close() {
+            self.overlay = Some(Overlay::Settings);
         }
     }
 
@@ -995,6 +1076,7 @@ impl eframe::App for SnapDogInstallerApp {
             Some(Overlay::EraseConfirmation) => self.show_erase_confirmation(context),
             Some(Overlay::SkipConfirmation) => self.show_skip_confirmation(context),
             Some(Overlay::Settings) => self.show_settings(context),
+            Some(Overlay::ThirdPartyNotices) => self.show_third_party_notices(context),
             Some(Overlay::CloseConfirmation) => self.show_close_confirmation(context),
             None => {}
         }
@@ -1229,7 +1311,7 @@ fn failure_screen(ui: &mut egui::Ui, failure: &FailureState) -> ScreenAction {
         if eject_only {
             ui.label(
                 RichText::new(
-                    "The image was written, but macOS could not eject the card automatically. Eject it in Finder or Disk Utility before removing it.",
+                    "The image was written, but the system could not eject the card automatically. Use the operating system’s eject or safe-removal control before removing it.",
                 )
                 .color(ORANGE),
             );
@@ -1359,7 +1441,35 @@ where
     run_pipeline(request, &downloader, &runner, control, emit)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn execute_pipeline<F>(
+    request: &PipelineRequest,
+    control: &PipelineControl,
+    emit: F,
+) -> Result<PipelineReport, PipelineError>
+where
+    F: FnMut(PipelineEvent),
+{
+    let downloader = DownloadClient::new()?;
+    let runner = LinuxWorkerRunner::current()?;
+    run_pipeline(request, &downloader, &runner, control, emit)
+}
+
+#[cfg(target_os = "windows")]
+fn execute_pipeline<F>(
+    request: &PipelineRequest,
+    control: &PipelineControl,
+    emit: F,
+) -> Result<PipelineReport, PipelineError>
+where
+    F: FnMut(PipelineEvent),
+{
+    let downloader = DownloadClient::new()?;
+    let runner = WindowsWorkerRunner::current()?;
+    run_pipeline(request, &downloader, &runner, control, emit)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn execute_pipeline<F>(
     _request: &PipelineRequest,
     _control: &PipelineControl,
@@ -1373,6 +1483,25 @@ where
 
 const fn supports_manifest_schema(schema_version: Option<u32>) -> bool {
     matches!(schema_version, Some(2))
+}
+
+fn validate_release_image(manifest: &Manifest, board: Board) -> Result<(), String> {
+    if !supports_manifest_schema(manifest.schema_version) {
+        return Err(
+            "This release is waiting for safe installer metadata. Try again shortly.".to_owned(),
+        );
+    }
+    let image = manifest
+        .image_for(board)
+        .ok_or_else(|| "This release has no image for the selected Raspberry Pi".to_owned())?;
+    if image.url.is_none() {
+        return Err("Release metadata is missing the immutable image URL".to_owned());
+    }
+    required_hash(image.sha256.as_deref(), "compressed image")?;
+    required_hash(image.raw_sha256.as_deref(), "raw image")?;
+    required_size(image.compressed_size, "compressed image")?;
+    required_size(image.uncompressed_size, "raw image")?;
+    Ok(())
 }
 
 fn required_hash(value: Option<&str>, name: &str) -> Result<String, String> {
@@ -1638,7 +1767,34 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::model::ImageInfo;
+
+    fn release_manifest(schema_version: Option<u32>) -> Manifest {
+        Manifest {
+            schema_version,
+            channel: Channel::Release,
+            version: "0.13.0".to_owned(),
+            commit: Some("abc123".to_owned()),
+            date: "2026-07-19T00:00:00Z".to_owned(),
+            boards: BTreeMap::from([(
+                Board::Pi4.id().to_owned(),
+                ImageInfo {
+                    image: "snapdog-os-pi4-release.img.gz".to_owned(),
+                    sha256: Some("a".repeat(64)),
+                    url: Some(
+                        "https://updates.snapdog.cc/os/images/snapdog-os-pi4-0.13.0.img.gz"
+                            .to_owned(),
+                    ),
+                    compressed_size: Some(42),
+                    uncompressed_size: Some(84),
+                    raw_sha256: Some("b".repeat(64)),
+                },
+            )]),
+        }
+    }
 
     #[test]
     fn validates_integrity_metadata_helpers() {
@@ -1650,6 +1806,22 @@ mod tests {
         assert!(required_hash(Some("nope"), "image").is_err());
         assert_eq!(required_size(Some(42), "image").unwrap(), 42);
         assert!(required_size(Some(0), "image").is_err());
+    }
+
+    #[test]
+    fn release_selection_fails_closed_until_manifest_v2_is_complete() {
+        assert!(validate_release_image(&release_manifest(Some(2)), Board::Pi4).is_ok());
+
+        let legacy = release_manifest(None);
+        assert!(validate_release_image(&legacy, Board::Pi4).is_err());
+
+        let mut incomplete = release_manifest(Some(2));
+        incomplete
+            .boards
+            .get_mut(Board::Pi4.id())
+            .unwrap()
+            .raw_sha256 = None;
+        assert!(validate_release_image(&incomplete, Board::Pi4).is_err());
     }
 
     #[test]

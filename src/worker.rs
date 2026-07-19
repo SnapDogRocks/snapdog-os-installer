@@ -2,27 +2,37 @@
 
 //! Privileged flash-worker boundary.
 //!
-//! The public production entry point is deliberately available only on macOS and requires a
-//! [`RawDeviceGate`]. The actual orchestration is backend-driven so all destructive behaviour can
-//! be exercised in tests with ordinary files, without ever opening a real device.
+//! Production entry points require a platform-native elevation flow and a [`RawDeviceGate`]. The
+//! actual orchestration is backend-driven so all destructive behaviour can be exercised in tests
+//! with ordinary files, without ever opening a real device.
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::flash::{FlashError, FlashProgress, FlashReport, FlashStage, write_raw_from};
+use crate::flash::{
+    FlashError, FlashProgress, FlashReport, FlashStage, FlashWriteOptions,
+    write_raw_from_with_prepare,
+};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Current serialized worker-job schema.
 pub const WORKER_JOB_SCHEMA_VERSION: u32 = 1;
@@ -34,9 +44,38 @@ const RAW_DEVICE_OPT_IN: &str = "SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE";
 #[cfg(target_os = "macos")]
 const RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
 
-#[cfg(target_os = "macos")]
+/// Worker argument carrying the pinned job-file digest across interactive authorization.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub const WORKER_JOB_SHA256_ARGUMENT: &str = "--worker-job-sha256";
+/// Windows-compatible name retained for the UAC-specific launch boundary.
+#[cfg(target_os = "windows")]
+pub const WINDOWS_JOB_SHA256_ARGUMENT: &str = WORKER_JOB_SHA256_ARGUMENT;
+/// Windows worker argument proving intentional raw-device re-entry.
+#[cfg(target_os = "windows")]
+pub const WINDOWS_RAW_DEVICE_OPT_IN_ARGUMENT: &str = "--raw-device-opt-in";
+/// Exact Windows worker opt-in value.
+#[cfg(target_os = "windows")]
+pub const WINDOWS_RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const WORKER_JOB_ARGUMENT: &str = "--worker-job";
 const STAGING_BUFFER_SIZE: usize = 1024 * 1024;
+#[cfg(target_os = "windows")]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const WINDOWS_ADMIN_CHECK: &str = r"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$PSModuleAutoloadingPreference = 'None'
+$env:PSModulePath = ''
+$principal = [Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    exit 0
+}
+exit 1
+";
 
 /// Target identity captured while the user selected a drive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,7 +188,7 @@ pub enum WorkerError {
     InvalidJob(String),
     #[error("raw-device execution is not explicitly enabled")]
     RawDeviceDisabled,
-    #[error("the privileged worker must run as root")]
+    #[error("the privileged worker must run with administrator privileges")]
     NotRoot,
     #[error("the selected target is no longer available")]
     TargetMissing,
@@ -186,15 +225,74 @@ impl RawDeviceGate {
             return Err(WorkerError::RawDeviceDisabled);
         }
 
-        let output = std::process::Command::new("/usr/bin/id")
-            .arg("-u")
-            .output()
-            .map_err(|error| WorkerError::Platform(error.to_string()))?;
+        Self::from_root_worker()
+    }
+
+    /// Validate the root identity supplied by `PolicyKit`.
+    ///
+    /// Linux deliberately does not transport the accidental-write environment opt-in through a
+    /// generic elevated `env` process. The exact worker CLI, private session contract, root token,
+    /// and worker-side target revalidation form the authorization boundary instead.
+    #[cfg(target_os = "linux")]
+    pub fn from_environment() -> Result<Self, WorkerError> {
+        Self::from_root_worker()
+    }
+
+    #[cfg(unix)]
+    fn from_root_worker() -> Result<Self, WorkerError> {
+        let output = ["/usr/bin/id", "/bin/id"]
+            .into_iter()
+            .find_map(|program| std::process::Command::new(program).arg("-u").output().ok())
+            .ok_or_else(|| {
+                WorkerError::Platform("could not determine the worker user ID".to_owned())
+            })?;
         if !output.status.success() || output.stdout != b"0\n" {
             return Err(WorkerError::NotRoot);
         }
         Ok(Self { _private: () })
     }
+
+    /// Validate the explicit opt-in and an elevated Windows administrator token.
+    #[cfg(target_os = "windows")]
+    pub fn from_environment() -> Result<Self, WorkerError> {
+        if !windows_worker_arguments_are_authorized() {
+            return Err(WorkerError::RawDeviceDisabled);
+        }
+        let status = windows_powershell_command()?
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                WINDOWS_ADMIN_CHECK,
+            ])
+            .creation_flags(WINDOWS_CREATE_NO_WINDOW)
+            .status()
+            .map_err(|error| WorkerError::Platform(error.to_string()))?;
+        if !status.success() {
+            return Err(WorkerError::NotRoot);
+        }
+        Ok(Self { _private: () })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_worker_arguments_are_authorized() -> bool {
+    let mut arguments = std::env::args_os();
+    let _executable = arguments.next();
+    arguments.next().as_deref() == Some(std::ffi::OsStr::new(WORKER_JOB_ARGUMENT))
+        && arguments.next().is_some()
+        && arguments.next().as_deref() == Some(std::ffi::OsStr::new(WINDOWS_JOB_SHA256_ARGUMENT))
+        && arguments
+            .next()
+            .is_some_and(|value| valid_sha256(&value.to_string_lossy()))
+        && arguments.next().as_deref()
+            == Some(std::ffi::OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_ARGUMENT))
+        && arguments.next().as_deref()
+            == Some(std::ffi::OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_VALUE))
+        && arguments.next().is_none()
 }
 
 /// Emit progress events to an arbitrary writer using JSON Lines.
@@ -231,6 +329,20 @@ impl<W: Write> ProgressSink for JsonLineProgress<W> {
 /// elevated worker process. No raw path supplied by the job is opened directly.
 #[cfg(target_os = "macos")]
 pub fn run_macos_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashReport, WorkerError> {
+    run_unix_worker(job, &mut macos::MacOsPlatform)
+}
+
+/// Run one raw-device job on Linux after native privilege elevation.
+#[cfg(target_os = "linux")]
+pub fn run_linux_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashReport, WorkerError> {
+    run_unix_worker(job, &mut linux::LinuxPlatform)
+}
+
+#[cfg(unix)]
+fn run_unix_worker<P>(job: &WorkerJob, platform: &mut P) -> Result<FlashReport, WorkerError>
+where
+    P: WorkerPlatform,
+{
     let session = PrivilegedSession::validate(job, &current_worker_job_path()?)?;
     validate_job(job)?;
     let writer: Box<dyn Write> = match &job.progress {
@@ -238,21 +350,39 @@ pub fn run_macos_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashRe
         ProgressDestination::File { path } => Box::new(open_progress_file(path, &session)?),
     };
     let mut progress = JsonLineProgress::new(writer);
-    run_and_report(job, &mut macos::MacOsPlatform, &mut progress)
+    run_and_report(job, platform, &mut progress)
 }
 
-#[cfg(target_os = "macos")]
+/// Run one raw-device job on Windows after UAC elevation.
+#[cfg(target_os = "windows")]
+pub fn run_windows_worker(
+    job: &WorkerJob,
+    _gate: RawDeviceGate,
+) -> Result<FlashReport, WorkerError> {
+    let session = WindowsPrivilegedSession::validate(job, &current_worker_job_path()?)?;
+    validate_job(job)?;
+    let writer: Box<dyn Write> = match &job.progress {
+        ProgressDestination::Stdout => Box::new(io::stdout()),
+        ProgressDestination::File { path } => Box::new(open_windows_progress_file(path, &session)?),
+    };
+    let mut progress = JsonLineProgress::new(writer);
+    run_and_report(job, &mut windows::WindowsPlatform::default(), &mut progress)
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct PrivilegedSession {
     directory: PathBuf,
     owner_uid: u32,
     directory_device: u64,
     directory_inode: u64,
+    parent_owner_uid: u32,
+    parent_mode: u32,
     parent_device: u64,
     parent_inode: u64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl PrivilegedSession {
     fn validate(job: &WorkerJob, job_path: &Path) -> Result<Self, WorkerError> {
         use std::os::unix::fs::MetadataExt;
@@ -272,8 +402,7 @@ impl PrivilegedSession {
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
             || metadata.uid() == 0
-            || metadata.mode() & 0o700 != 0o700
-            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o7777 != 0o700
         {
             return Err(invalid_session(format!(
                 "session directory must be private and non-root-owned (uid {}, mode {:o})",
@@ -287,14 +416,9 @@ impl PrivilegedSession {
         let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
             invalid_session(format!("session parent directory is unavailable: {error}"))
         })?;
-        if parent_metadata.file_type().is_symlink()
-            || !parent_metadata.is_dir()
-            || parent_metadata.uid() != metadata.uid()
-            || parent_metadata.mode() & 0o700 != 0o700
-            || parent_metadata.mode() & 0o077 != 0
-        {
+        if !valid_session_parent(&parent_metadata, metadata.uid()) {
             return Err(invalid_session(
-                "session directory must live directly inside a private owner-only directory",
+                "session directory must live inside an approved private or sticky temporary directory",
             ));
         }
 
@@ -303,6 +427,8 @@ impl PrivilegedSession {
             owner_uid: metadata.uid(),
             directory_device: metadata.dev(),
             directory_inode: metadata.ino(),
+            parent_owner_uid: parent_metadata.uid(),
+            parent_mode: parent_metadata.mode(),
             parent_device: parent_metadata.dev(),
             parent_inode: parent_metadata.ino(),
         };
@@ -339,7 +465,8 @@ impl PrivilegedSession {
         self.ensure_directory_unchanged()?;
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| invalid_session(format!("{expected_name} is unavailable: {error}")))?;
-        self.validate_file_metadata(&metadata, expected_name, expected_size, require_empty)
+        self.validate_file_metadata(&metadata, expected_name, expected_size, require_empty)?;
+        self.ensure_directory_unchanged()
     }
 
     fn validate_marker(&self, path: Option<&Path>, expected_name: &str) -> Result<(), WorkerError> {
@@ -380,8 +507,7 @@ impl PrivilegedSession {
             || metadata.uid() != self.owner_uid
             || metadata.dev() != self.directory_device
             || metadata.ino() != self.directory_inode
-            || metadata.mode() & 0o700 != 0o700
-            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o7777 != 0o700
         {
             return Err(invalid_session(
                 "session directory changed during authorization",
@@ -395,11 +521,10 @@ impl PrivilegedSession {
             .map_err(|error| invalid_session(format!("session parent changed: {error}")))?;
         if parent_metadata.file_type().is_symlink()
             || !parent_metadata.is_dir()
-            || parent_metadata.uid() != self.owner_uid
+            || parent_metadata.uid() != self.parent_owner_uid
+            || parent_metadata.mode() != self.parent_mode
             || parent_metadata.dev() != self.parent_device
             || parent_metadata.ino() != self.parent_inode
-            || parent_metadata.mode() & 0o700 != 0o700
-            || parent_metadata.mode() & 0o077 != 0
         {
             return Err(invalid_session(
                 "session parent directory changed during authorization",
@@ -434,6 +559,355 @@ impl PrivilegedSession {
 }
 
 #[cfg(target_os = "macos")]
+fn valid_session_parent(metadata: &fs::Metadata, owner_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    !metadata.file_type().is_symlink()
+        && metadata.is_dir()
+        && metadata.uid() == owner_uid
+        && metadata.mode() & 0o7777 == 0o700
+}
+
+#[cfg(target_os = "linux")]
+fn valid_session_parent(metadata: &fs::Metadata, owner_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let private_owner = metadata.uid() == owner_uid && metadata.mode() & 0o7777 == 0o700;
+    let root_sticky_temp = metadata.uid() == 0 && metadata.mode() & 0o7777 == 0o1777;
+    private_owner || root_sticky_temp
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WindowsPrivilegedSession {
+    directory: PathBuf,
+    directory_handle: same_file::Handle,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsPrivilegedSession {
+    fn validate(job: &WorkerJob, job_path: &Path) -> Result<Self, WorkerError> {
+        let directory = job
+            .raw_path
+            .parent()
+            .ok_or_else(|| invalid_session("raw image has no parent directory"))?
+            .to_path_buf();
+        if !is_clean_windows_absolute_path(&directory) {
+            return Err(invalid_session("session directory path is not canonical"));
+        }
+        validate_windows_local_fixed_disk(&directory)?;
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            invalid_session(format!("session directory is unavailable: {error}"))
+        })?;
+        validate_windows_metadata(&metadata, true, None, false, "session directory")?;
+        let directory_handle = same_file::Handle::from_path(&directory).map_err(|error| {
+            invalid_session(format!("could not pin session directory: {error}"))
+        })?;
+        let session = Self {
+            directory,
+            directory_handle,
+        };
+        session.validate_existing_file(job_path, "worker-job.json", None, false)?;
+        session.validate_existing_file(
+            &job.raw_path,
+            "snapdog-os.img",
+            Some(job.raw_size),
+            false,
+        )?;
+        let progress_path = match &job.progress {
+            ProgressDestination::File { path } => path,
+            ProgressDestination::Stdout => {
+                return Err(invalid_session(
+                    "privileged jobs require a session progress file",
+                ));
+            }
+        };
+        session.validate_existing_file(progress_path, "worker-progress.jsonl", Some(0), true)?;
+        session.validate_marker(job.cancel_path.as_deref(), "cancel")?;
+        session.validate_marker(job.skip_verification_path.as_deref(), "skip-verification")?;
+        Ok(session)
+    }
+
+    fn validate_existing_file(
+        &self,
+        path: &Path,
+        expected_name: &str,
+        expected_size: Option<u64>,
+        require_empty: bool,
+    ) -> Result<(), WorkerError> {
+        self.validate_member_path(path, expected_name)?;
+        self.ensure_directory_unchanged()?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| invalid_session(format!("{expected_name} is unavailable: {error}")))?;
+        validate_windows_metadata(
+            &metadata,
+            false,
+            expected_size,
+            require_empty,
+            expected_name,
+        )?;
+        self.ensure_directory_unchanged()
+    }
+
+    fn validate_marker(&self, path: Option<&Path>, expected_name: &str) -> Result<(), WorkerError> {
+        let path = path.ok_or_else(|| {
+            invalid_session(format!(
+                "session marker {expected_name} is missing from the job"
+            ))
+        })?;
+        self.validate_member_path(path, expected_name)?;
+        self.ensure_directory_unchanged()?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                validate_windows_metadata(&metadata, false, Some(0), true, expected_name)?;
+                self.ensure_directory_unchanged()
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(invalid_session(format!(
+                "session marker {expected_name} is unavailable: {error}"
+            ))),
+        }
+    }
+
+    fn validate_member_path(&self, path: &Path, expected_name: &str) -> Result<(), WorkerError> {
+        if !is_clean_windows_absolute_path(path)
+            || path.parent() != Some(self.directory.as_path())
+            || path.file_name() != Some(std::ffi::OsStr::new(expected_name))
+        {
+            return Err(invalid_session(format!(
+                "{expected_name} must be a direct member of the private session directory"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_directory_unchanged(&self) -> Result<(), WorkerError> {
+        let metadata = fs::symlink_metadata(&self.directory)
+            .map_err(|error| invalid_session(format!("session directory changed: {error}")))?;
+        validate_windows_metadata(&metadata, true, None, false, "session directory")?;
+        let current = same_file::Handle::from_path(&self.directory)
+            .map_err(|error| invalid_session(format!("session directory changed: {error}")))?;
+        if current != self.directory_handle {
+            return Err(invalid_session(
+                "session directory changed during authorization",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_metadata(
+    metadata: &fs::Metadata,
+    directory: bool,
+    expected_size: Option<u64>,
+    require_empty: bool,
+    name: &str,
+) -> Result<(), WorkerError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let expected_type = if directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !expected_type
+        || expected_size.is_some_and(|size| metadata.len() != size)
+        || (require_empty && metadata.len() != 0)
+    {
+        return Err(invalid_session(format!(
+            "{name} has an unsafe type, reparse point, or size"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_clean_windows_absolute_path(path: &Path) -> bool {
+    windows_local_disk(path).is_some()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_local_disk(path: &Path) -> Option<u8> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let letter = match prefix.kind() {
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => letter,
+        Prefix::Verbatim(_)
+        | Prefix::VerbatimUNC(_, _)
+        | Prefix::DeviceNS(_)
+        | Prefix::UNC(_, _) => return None,
+    };
+    if !letter.is_ascii_alphabetic()
+        || !matches!(components.next(), Some(Component::RootDir))
+        || !components.all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(letter.to_ascii_uppercase())
+}
+
+#[cfg(target_os = "windows")]
+fn validate_windows_local_fixed_disk(path: &Path) -> Result<(), WorkerError> {
+    const SESSION_ROOT_ENV: &str = "SNAPDOG_SESSION_ROOT";
+    const CHECK_LOCAL_FIXED_DISK: &str = r"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$PSModuleAutoloadingPreference = 'None'
+$env:PSModulePath = ''
+$root = [string]$env:SNAPDOG_SESSION_ROOT
+if ($root.Length -ne 3 -or $root[1] -ne ':' -or $root[2] -ne '\') { exit 1 }
+$drive = [System.IO.DriveInfo]::new($root)
+if ($drive.IsReady -and $drive.DriveType -eq [System.IO.DriveType]::Fixed) { exit 0 }
+exit 1
+";
+    let letter = windows_local_disk(path)
+        .ok_or_else(|| invalid_session("session paths must use a local drive-letter root"))?;
+    let root = format!("{}:\\", char::from(letter));
+    let status = windows_powershell_command()?
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            CHECK_LOCAL_FIXED_DISK,
+        ])
+        .env(SESSION_ROOT_ENV, root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(WINDOWS_CREATE_NO_WINDOW)
+        .status()
+        .map_err(|error| invalid_session(format!("could not inspect session drive: {error}")))?;
+    if !status.success() {
+        return Err(invalid_session(
+            "worker session must be stored on a ready local fixed disk",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_powershell_command() -> Result<std::process::Command, WorkerError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const STORAGE_MODULE_ENV: &str = "SNAPDOG_STORAGE_MODULE";
+    const CIM_MODULE_ENV: &str = "SNAPDOG_CIM_MODULE";
+
+    // Resolve the system directory through the Windows Known Folders API. Environment variables
+    // such as SystemRoot, WINDIR, PATH, and PSModulePath are process-controlled input and must not
+    // select executables or modules for a privileged raw-disk helper.
+    let system_directory = known_folders::get_known_folder_path(known_folders::KnownFolder::System)
+        .ok_or_else(|| {
+            WorkerError::Platform("Windows system directory is unavailable".to_owned())
+        })?;
+    if windows_local_disk(&system_directory).is_none()
+        || system_directory
+            .file_name()
+            .is_none_or(|name| !name.to_string_lossy().eq_ignore_ascii_case("System32"))
+    {
+        return Err(WorkerError::Platform(
+            "Windows system directory is not a canonical local System32 path".to_owned(),
+        ));
+    }
+    let system_root = system_directory.parent().ok_or_else(|| {
+        WorkerError::Platform("Windows system directory has no parent".to_owned())
+    })?;
+    let system_temp = system_root.join("Temp");
+    let windows_powershell = system_directory.join("WindowsPowerShell");
+    let powershell_root = windows_powershell.join("v1.0");
+    let modules = powershell_root.join("Modules");
+    let storage_module_directory = modules.join("Storage");
+    let cim_module_directory = modules.join("CimCmdlets");
+    let powershell = powershell_root.join("powershell.exe");
+    let storage_module = storage_module_directory.join("Storage.psd1");
+    let cim_module = cim_module_directory.join("CimCmdlets.psd1");
+
+    for directory in [
+        system_root,
+        system_temp.as_path(),
+        system_directory.as_path(),
+        windows_powershell.as_path(),
+        powershell_root.as_path(),
+        modules.as_path(),
+        storage_module_directory.as_path(),
+        cim_module_directory.as_path(),
+    ] {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|error| WorkerError::Platform(error.to_string()))?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WorkerError::Platform(
+                "Windows PowerShell has an unsafe directory identity".to_owned(),
+            ));
+        }
+    }
+    for file in [&powershell, &storage_module, &cim_module] {
+        let metadata =
+            fs::symlink_metadata(file).map_err(|error| WorkerError::Platform(error.to_string()))?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WorkerError::Platform(
+                "Windows PowerShell has an unsafe executable or module identity".to_owned(),
+            ));
+        }
+    }
+
+    let mut command = std::process::Command::new(powershell);
+    command
+        .env_clear()
+        .env("SystemRoot", system_root)
+        .env("WINDIR", system_root)
+        .env("TEMP", &system_temp)
+        .env("TMP", &system_temp)
+        .env("PATH", &system_directory)
+        .env("PSModulePath", "")
+        .env(STORAGE_MODULE_ENV, storage_module)
+        .env(CIM_MODULE_ENV, cim_module);
+    Ok(command)
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_progress_file(
+    path: &Path,
+    session: &WindowsPrivilegedSession,
+) -> Result<File, WorkerError> {
+    session.validate_existing_file(path, "worker-progress.jsonl", Some(0), true)?;
+    let path_handle = same_file::Handle::from_path(path).map_err(WorkerError::Progress)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(WorkerError::Progress)?;
+    let opened_metadata = file.metadata().map_err(WorkerError::Progress)?;
+    validate_windows_metadata(
+        &opened_metadata,
+        false,
+        Some(0),
+        true,
+        "worker-progress.jsonl",
+    )?;
+    let opened_handle =
+        same_file::Handle::from_file(file.try_clone().map_err(WorkerError::Progress)?)
+            .map_err(WorkerError::Progress)?;
+    if path_handle != opened_handle {
+        return Err(invalid_session("progress path changed while it was opened"));
+    }
+    session.ensure_directory_unchanged()?;
+    file.set_len(0).map_err(WorkerError::Progress)?;
+    Ok(file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn current_worker_job_path() -> Result<PathBuf, WorkerError> {
     let mut arguments = std::env::args_os();
     let _executable = arguments.next();
@@ -444,25 +918,44 @@ fn current_worker_job_path() -> Result<PathBuf, WorkerError> {
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| invalid_session("worker job path is missing"))?;
-    if arguments.next().is_some() {
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let valid_trailing_arguments = arguments.next().as_deref()
+        == Some(std::ffi::OsStr::new(WORKER_JOB_SHA256_ARGUMENT))
+        && arguments
+            .next()
+            .is_some_and(|value| valid_sha256(&value.to_string_lossy()))
+        && arguments.next().is_none();
+    #[cfg(target_os = "windows")]
+    let valid_trailing_arguments = arguments.next().as_deref()
+        == Some(std::ffi::OsStr::new(WINDOWS_JOB_SHA256_ARGUMENT))
+        && arguments
+            .next()
+            .is_some_and(|value| valid_sha256(&value.to_string_lossy()))
+        && arguments.next().as_deref()
+            == Some(std::ffi::OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_ARGUMENT))
+        && arguments.next().as_deref()
+            == Some(std::ffi::OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_VALUE))
+        && arguments.next().is_none();
+    if !valid_trailing_arguments {
         return Err(invalid_session("worker re-entry has unexpected arguments"));
     }
     Ok(path)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn invalid_session(message: impl Into<String>) -> WorkerError {
     WorkerError::InvalidJob(message.into())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn is_clean_absolute_path(path: &Path) -> bool {
     let mut components = path.components();
     matches!(components.next(), Some(Component::RootDir))
         && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn open_progress_file(path: &Path, session: &PrivilegedSession) -> Result<File, WorkerError> {
     session.validate_existing_file(path, "worker-progress.jsonl", Some(0), true)?;
     let path_metadata = fs::symlink_metadata(path).map_err(WorkerError::Progress)?;
@@ -515,6 +1008,13 @@ trait WorkerPlatform {
         selected: &WorkerDrive,
         verify: bool,
     ) -> Result<Self::Target, WorkerError>;
+    fn prepare_verification(
+        &mut self,
+        _selected: &WorkerDrive,
+        target: &mut Self::Target,
+    ) -> Result<(), FlashError> {
+        target.sync_all().map_err(FlashError::from)
+    }
     fn eject(&mut self, selected: &WorkerDrive) -> Result<(), WorkerError>;
 }
 
@@ -566,7 +1066,13 @@ where
     signals.check_cancelled()?;
 
     progress.emit(&WorkerProgress::phase(WorkerPhase::Unmounting))?;
-    platform.unmount(&job.drive)?;
+    if let Err(error) = platform.unmount(&job.drive) {
+        // Platform preparation can fail after one or more volumes were already detached. Always
+        // give the backend a chance to finish its safe cleanup, while preserving the preparation
+        // error that explains why writing never started.
+        let _ = platform.eject(&job.drive);
+        return Err(error);
+    }
 
     let result = run_after_unmount(job, &mut raw_image, platform, progress, &signals);
     if result.is_err() {
@@ -649,13 +1155,15 @@ where
 
     let mut target = platform.open_target(&job.drive, job.verify)?;
     let mut callback_error = None;
-    let flash_result = write_raw_from(
+    let flash_result = write_raw_from_with_prepare(
         raw_image,
         &mut target,
-        job.drive.capacity,
-        job.verify,
-        signals.cancelled_flag(),
-        signals.skip_verification_flag(),
+        FlashWriteOptions {
+            target_capacity: job.drive.capacity,
+            verify: job.verify,
+            cancelled: signals.cancelled_flag(),
+            skip_verification: signals.skip_verification_flag(),
+        },
         |update| {
             if callback_error.is_some() {
                 return;
@@ -670,16 +1178,27 @@ where
                 callback_error = Some(error);
             }
         },
+        |target| platform.prepare_verification(&job.drive, target),
     );
 
     if let Some(error) = callback_error {
+        let _ = target.sync_all();
         drop(target);
         return Err(error);
     }
 
-    if signals.is_cancelled()? {
-        drop(target);
-        return Err(WorkerError::Cancelled);
+    match signals.is_cancelled() {
+        Ok(true) => {
+            let _ = target.sync_all();
+            drop(target);
+            return Err(WorkerError::Cancelled);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            let _ = target.sync_all();
+            drop(target);
+            return Err(error);
+        }
     }
 
     let report = match flash_result {
@@ -692,16 +1211,22 @@ where
             report
         }
         Ok(_) => {
+            let _ = target.sync_all();
             drop(target);
             return Err(FlashError::Verification.into());
         }
         Err(error) => {
+            let _ = target.sync_all();
             drop(target);
             return Err(error.into());
         }
     };
 
-    progress.emit(&WorkerProgress::phase(WorkerPhase::Syncing))?;
+    if let Err(error) = progress.emit(&WorkerProgress::phase(WorkerPhase::Syncing)) {
+        let _ = target.sync_all();
+        drop(target);
+        return Err(error);
+    }
     target.sync_all().map_err(FlashError::from)?;
     drop(target);
 
@@ -718,12 +1243,7 @@ fn validate_job(job: &WorkerJob) -> Result<(), WorkerError> {
             job.schema_version
         )));
     }
-    let Some(disk_identifier) = disk_identifier(&job.drive.id) else {
-        return Err(WorkerError::InvalidJob(
-            "invalid whole-disk identity".to_owned(),
-        ));
-    };
-    if job.drive.device != format!("/dev/{disk_identifier}") || job.drive.capacity == 0 {
+    if !valid_worker_drive(&job.drive) {
         return Err(WorkerError::InvalidJob(
             "invalid whole-disk identity".to_owned(),
         ));
@@ -780,7 +1300,7 @@ fn open_raw_image(job: &WorkerJob) -> Result<File, WorkerError> {
         ));
     }
 
-    let file = File::open(&job.raw_path)
+    let file = open_raw_image_file(&job.raw_path)
         .map_err(|error| WorkerError::InvalidJob(format!("raw image is not readable: {error}")))?;
     let opened_metadata = file
         .metadata()
@@ -803,7 +1323,64 @@ fn open_raw_image(job: &WorkerJob) -> Result<File, WorkerError> {
             ));
         }
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        // UAC introduces a comparatively long hand-off window. Pin both the current path and the
+        // opened descriptor, then compare their Windows file identities before any bytes are
+        // staged. Re-checking the path metadata also rejects a reparse point installed between
+        // the first metadata lookup and File::open.
+        let current_path_metadata = fs::symlink_metadata(&job.raw_path).map_err(|error| {
+            WorkerError::InvalidJob(format!("raw image is not readable: {error}"))
+        })?;
+        validate_windows_metadata(
+            &current_path_metadata,
+            false,
+            Some(job.raw_size),
+            false,
+            "snapdog-os.img",
+        )?;
+        validate_windows_metadata(
+            &opened_metadata,
+            false,
+            Some(job.raw_size),
+            false,
+            "snapdog-os.img",
+        )?;
+        let path_handle = same_file::Handle::from_path(&job.raw_path).map_err(|error| {
+            WorkerError::InvalidJob(format!("raw image identity is unavailable: {error}"))
+        })?;
+        let opened_handle = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+            WorkerError::InvalidJob(format!("raw image identity is unavailable: {error}"))
+        })?)
+        .map_err(|error| {
+            WorkerError::InvalidJob(format!("raw image identity is unavailable: {error}"))
+        })?;
+        if path_handle != opened_handle {
+            return Err(WorkerError::InvalidJob(
+                "raw image changed while it was opened".to_owned(),
+            ));
+        }
+    }
     Ok(file)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_raw_image_file(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(target_os = "windows")]
+fn open_raw_image_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    OpenOptions::new()
+        .read(true)
+        // The unelevated runner already pins this file with the same sharing contract. Keep that
+        // protection active while hashing so no new writer or path replacement can race UAC.
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
 }
 
 const fn progress_from_flash(progress: FlashProgress) -> WorkerProgress {
@@ -823,6 +1400,7 @@ const fn progress_from_flash(progress: FlashProgress) -> WorkerProgress {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn disk_identifier(id: &str) -> Option<&str> {
     let (disk_id, stable_suffix) = id
         .split_once('@')
@@ -837,6 +1415,52 @@ fn disk_identifier(id: &str) -> Option<&str> {
         return None;
     }
     Some(disk_id)
+}
+
+#[cfg(target_os = "macos")]
+fn valid_worker_drive(drive: &WorkerDrive) -> bool {
+    let Some((disk_id, _registry_entry_id)) = crate::drives::macos_stable_disk_id(&drive.id) else {
+        return false;
+    };
+    drive.capacity > 0 && drive.device == format!("/dev/{disk_id}")
+}
+
+#[cfg(target_os = "linux")]
+fn valid_worker_drive(drive: &WorkerDrive) -> bool {
+    let Some((block_name, diskseq)) = drive.id.split_once('@') else {
+        return false;
+    };
+    !block_name.is_empty()
+        && block_name.len() <= 128
+        && block_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && !diskseq.is_empty()
+        && diskseq.bytes().all(|byte| byte.is_ascii_digit())
+        && diskseq.parse::<u64>().is_ok_and(|value| value > 0)
+        && drive.device == format!("/dev/{block_name}")
+        && drive.capacity > 0
+}
+
+#[cfg(target_os = "windows")]
+fn valid_worker_drive(drive: &WorkerDrive) -> bool {
+    const PREFIX: &str = r"\\.\PHYSICALDRIVE";
+
+    let Some((device, fingerprint)) = drive.id.rsplit_once('@') else {
+        return false;
+    };
+    let Some(number) = device.strip_prefix(PREFIX) else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && number
+            .parse::<u32>()
+            .is_ok_and(|value| device == format!("{PREFIX}{value}"))
+        && fingerprint.len() == 64
+        && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && drive.device == device
+        && drive.capacity > 0
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -919,8 +1543,11 @@ fn marker_exists(path: Option<&Path>) -> Result<bool, WorkerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use sha2::{Digest, Sha256};
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
 
@@ -929,15 +1556,58 @@ mod tests {
     struct FilePlatform {
         current: WorkerDrive,
         target_path: PathBuf,
+        sync_count: Rc<Cell<usize>>,
         mutate_raw_after_staging: Option<(PathBuf, Vec<u8>)>,
         validations: usize,
-        fail_second_validation: bool,
+        failure: FailureMode,
         unmounted: bool,
         ejected: bool,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FailureMode {
+        None,
+        SecondValidation,
+        Unmount,
+        VerificationBarrier,
+    }
+
+    struct TrackingFile {
+        file: File,
+        sync_count: Rc<Cell<usize>>,
+    }
+
+    impl Read for TrackingFile {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.file.read(buffer)
+        }
+    }
+
+    impl Write for TrackingFile {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.file.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Seek for TrackingFile {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.file.seek(position)
+        }
+    }
+
+    impl WorkerTarget for TrackingFile {
+        fn sync_all(&self) -> io::Result<()> {
+            self.sync_count.set(self.sync_count.get() + 1);
+            self.file.sync_all()
+        }
+    }
+
     impl WorkerPlatform for FilePlatform {
-        type Target = File;
+        type Target = TrackingFile;
 
         fn validate_target(&mut self, _selected: &WorkerDrive) -> Result<WorkerDrive, WorkerError> {
             self.validations += 1;
@@ -947,7 +1617,7 @@ mod tests {
                 fs::write(path, replacement)
                     .map_err(|error| WorkerError::Platform(error.to_string()))?;
             }
-            if self.fail_second_validation && self.validations == 2 {
+            if self.failure == FailureMode::SecondValidation && self.validations == 2 {
                 return Err(WorkerError::TargetMissing);
             }
             Ok(self.current.clone())
@@ -955,7 +1625,11 @@ mod tests {
 
         fn unmount(&mut self, _selected: &WorkerDrive) -> Result<(), WorkerError> {
             self.unmounted = true;
-            Ok(())
+            if self.failure == FailureMode::Unmount {
+                Err(WorkerError::Platform("partial unmount failed".to_owned()))
+            } else {
+                Ok(())
+            }
         }
 
         fn open_target(
@@ -963,11 +1637,30 @@ mod tests {
             _selected: &WorkerDrive,
             verify: bool,
         ) -> Result<Self::Target, WorkerError> {
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(verify)
                 .write(true)
                 .open(&self.target_path)
-                .map_err(|error| WorkerError::Platform(error.to_string()))
+                .map_err(|error| WorkerError::Platform(error.to_string()))?;
+            Ok(TrackingFile {
+                file,
+                sync_count: Rc::clone(&self.sync_count),
+            })
+        }
+
+        fn prepare_verification(
+            &mut self,
+            _selected: &WorkerDrive,
+            target: &mut Self::Target,
+        ) -> Result<(), FlashError> {
+            target.sync_all().map_err(FlashError::from)?;
+            if self.failure == FailureMode::VerificationBarrier {
+                Err(FlashError::Io(io::Error::other(
+                    "injected verification barrier failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         fn eject(&mut self, _selected: &WorkerDrive) -> Result<(), WorkerError> {
@@ -986,9 +1679,52 @@ mod tests {
         }
     }
 
+    struct CancellingEvents {
+        cancel_path: PathBuf,
+        events: Vec<WorkerProgress>,
+    }
+
+    impl ProgressSink for CancellingEvents {
+        fn emit(&mut self, progress: &WorkerProgress) -> Result<(), WorkerError> {
+            self.events.push(progress.clone());
+            if progress.phase == WorkerPhase::Writing && !self.cancel_path.exists() {
+                fs::write(&self.cancel_path, []).map_err(WorkerError::Progress)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_worker_drive(capacity: u64) -> WorkerDrive {
+        WorkerDrive {
+            id: "disk42@4242".to_owned(),
+            device: "/dev/disk42".to_owned(),
+            capacity,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_worker_drive(capacity: u64) -> WorkerDrive {
+        WorkerDrive {
+            id: "sdz@4242".to_owned(),
+            device: "/dev/sdz".to_owned(),
+            capacity,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn test_worker_drive(capacity: u64) -> WorkerDrive {
+        let device = r"\\.\PHYSICALDRIVE42".to_owned();
+        WorkerDrive {
+            id: format!("{device}@{}", "a".repeat(64)),
+            device,
+            capacity,
+        }
+    }
+
     fn fixture() -> (TempDir, WorkerJob, FilePlatform, Vec<u8>) {
         let directory = TempDir::new().unwrap();
-        let payload = b"snapdog worker image".repeat(32_768);
+        let payload = b"snapdog worker image".repeat(131_072);
         let raw_path = directory.path().join("image.img");
         fs::write(&raw_path, &payload).unwrap();
 
@@ -997,11 +1733,7 @@ mod tests {
         target.set_len(payload.len() as u64 + 4096).unwrap();
         drop(target);
 
-        let drive = WorkerDrive {
-            id: "disk42".to_owned(),
-            device: "/dev/disk42".to_owned(),
-            capacity: payload.len() as u64 + 4096,
-        };
+        let drive = test_worker_drive(payload.len() as u64 + 4096);
         let job = WorkerJob {
             schema_version: WORKER_JOB_SCHEMA_VERSION,
             drive: drive.clone(),
@@ -1016,9 +1748,10 @@ mod tests {
         let platform = FilePlatform {
             current: drive,
             target_path,
+            sync_count: Rc::new(Cell::new(0)),
             mutate_raw_after_staging: None,
             validations: 0,
-            fail_second_validation: false,
+            failure: FailureMode::None,
             unmounted: false,
             ejected: false,
         };
@@ -1078,7 +1811,7 @@ mod tests {
     #[test]
     fn failure_after_unmount_attempts_eject() {
         let (_directory, job, mut platform, _payload) = fixture();
-        platform.fail_second_validation = true;
+        platform.failure = FailureMode::SecondValidation;
         let mut events = Events::default();
 
         let result = run_and_report(&job, &mut platform, &mut events);
@@ -1087,6 +1820,58 @@ mod tests {
         assert!(platform.unmounted);
         assert!(platform.ejected);
         assert_eq!(platform.validations, 2);
+    }
+
+    #[test]
+    fn partial_unmount_failure_attempts_eject() {
+        let (_directory, job, mut platform, _payload) = fixture();
+        platform.failure = FailureMode::Unmount;
+        let mut events = Events::default();
+
+        let result = run_and_report(&job, &mut platform, &mut events);
+
+        assert!(matches!(result, Err(WorkerError::Platform(_))));
+        assert!(platform.unmounted);
+        assert!(platform.ejected);
+        assert_eq!(platform.validations, 1);
+    }
+
+    #[test]
+    fn verification_failure_syncs_target_before_cleanup() {
+        let (_directory, job, mut platform, _payload) = fixture();
+        platform.failure = FailureMode::VerificationBarrier;
+        let mut events = Events::default();
+
+        let result = run_and_report(&job, &mut platform, &mut events);
+
+        assert!(matches!(result, Err(WorkerError::Flash(_))));
+        // The platform barrier performs the first durable flush. The error path must make a
+        // second best-effort sync before dropping the target and attempting cleanup.
+        assert!(platform.sync_count.get() >= 2);
+        assert!(platform.ejected);
+    }
+
+    #[test]
+    fn cancellation_after_writing_starts_syncs_target_before_cleanup() {
+        let (directory, mut job, mut platform, _payload) = fixture();
+        let cancel_path = directory.path().join("cancel-during-write");
+        job.cancel_path = Some(cancel_path.clone());
+        let mut events = CancellingEvents {
+            cancel_path,
+            events: Vec::new(),
+        };
+
+        let result = run_and_report(&job, &mut platform, &mut events);
+
+        assert!(matches!(result, Err(WorkerError::Cancelled)));
+        assert!(platform.sync_count.get() >= 1);
+        assert!(platform.ejected);
+        assert!(
+            events
+                .events
+                .iter()
+                .any(|event| event.phase == WorkerPhase::Writing)
+        );
     }
 
     #[test]
@@ -1108,8 +1893,8 @@ mod tests {
     fn rejects_partition_identifier_and_bad_hash() {
         let (_directory, mut job, mut platform, _payload) = fixture();
         let mut events = Events::default();
-        job.drive.id = "disk42s1".to_owned();
-        job.drive.device = "/dev/disk42s1".to_owned();
+        job.drive.id = "invalid/partition".to_owned();
+        job.drive.device = "invalid/partition".to_owned();
         assert!(matches!(
             run_and_report(&job, &mut platform, &mut events),
             Err(WorkerError::InvalidJob(_))
@@ -1218,7 +2003,7 @@ mod tests {
         assert_eq!(platform.validations, 0);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn progress_file_must_already_be_regular_file() {
         let (_directory, job, job_path) = privileged_session_fixture();
@@ -1230,7 +2015,7 @@ mod tests {
         assert!(open_progress_file(path, &session).is_err());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn privileged_session_rejects_progress_outside_its_private_directory() {
         let (_directory, mut job, job_path) = privileged_session_fixture();
@@ -1245,7 +2030,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
     fn privileged_session_rejects_multiply_linked_progress_file() {
         let (_directory, job, job_path) = privileged_session_fixture();
@@ -1262,9 +2047,12 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     fn privileged_session_fixture() -> (TempDir, WorkerJob, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let payload = b"session image";
         let raw_path = directory.path().join("snapdog-os.img");
         fs::write(&raw_path, payload).unwrap();
@@ -1274,11 +2062,7 @@ mod tests {
         fs::write(&job_path, b"{}").unwrap();
         let job = WorkerJob {
             schema_version: WORKER_JOB_SCHEMA_VERSION,
-            drive: WorkerDrive {
-                id: "disk42".to_owned(),
-                device: "/dev/disk42".to_owned(),
-                capacity: 4096,
-            },
+            drive: test_worker_drive(4096),
             raw_path,
             raw_size: payload.len() as u64,
             verify: true,
