@@ -20,6 +20,31 @@ env:
   RUST_VERSION: 1.88.0
 
 jobs:
+  conventional-commits:
+    name: Conventional commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Validate pull-request commits and title
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          ./scripts/check-conventional-commits.py --self-test
+          enforcement_sha=$(git log --reverse --diff-filter=A --format=%H \
+            "$BASE_SHA..$HEAD_SHA" -- scripts/check-conventional-commits.py | head -1)
+          if [ -n "$enforcement_sha" ]; then
+            BASE_SHA="$enforcement_sha^"
+          fi
+          ./scripts/check-conventional-commits.py --range "$BASE_SHA" "$HEAD_SHA"
+          ./scripts/check-conventional-commits.py --message "$PR_TITLE"
+
   lint-test:
     name: Strict lint, test, policy, and packaging validation
     runs-on: ubuntu-24.04
