@@ -50,10 +50,12 @@ try {
         throw "dumpbin dependency inspection failed for $Output.`n$DependenciesOutput"
     }
     $RedistributablePattern = '(?im)^\s*((?:vcruntime|msvcp|msvcr|concrt|ucrtbase|api-ms-win-crt-)[A-Za-z0-9._-]*\.dll)\s*$'
-    $RedistributableDependencies = [regex]::Matches(
-        $DependenciesOutput,
-        $RedistributablePattern
-    ) | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $RedistributableDependencies = @(
+        [regex]::Matches(
+            $DependenciesOutput,
+            $RedistributablePattern
+        ) | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    )
     if ($RedistributableDependencies.Count -ne 0) {
         throw "Packaged executable depends on a dynamic VC/UCRT runtime: $($RedistributableDependencies -join ', ')"
     }
