@@ -3,23 +3,29 @@
 SnapDog OS Installer is one Rust executable with two runtime modes:
 
 1. The unprivileged `egui` application selects an OS image and exactly one removable target.
-2. The same executable will re-launch in a narrowly scoped privileged worker mode for unmounting
+2. The same executable re-launches in a narrowly scoped privileged worker mode for unmounting
    and writing that selected target. There is no separately shipped sidecar.
 
-The worker boundary is deliberately not connected in the first local milestone. The current flash
-pipeline is exercised only against ordinary temporary files.
+The macOS worker boundary is connected for local testing. The automated pipeline remains fully
+file-backed and never opens raw devices; a real device is reachable only through the explicit UI
+selection, erase confirmation, native administrator prompt, root gate, and final worker-side target
+revalidation.
 
 ## Image pipeline
 
 - Load stable and beta release manifests without downloading image archives.
 - Select the newest available version by default.
 - Download only after the user presses **Flash**.
-- Verify the compressed archive SHA-256 before opening the target.
-- Decompress with a bounded buffer and refuse writes beyond the reported target capacity.
+- Verify compressed size and SHA-256 before opening the target.
+- Decompress to a private temporary raw file with a bounded buffer; verify its size and SHA-256.
+- In the privileged worker, copy the prepared image into an unlinked, root-owned staging file and
+  verify it again before enumerating the target. The worker writes from that same staged descriptor,
+  preventing path replacement or same-inode mutation from changing bytes after validation.
+- Refuse images larger than the reported target capacity before requesting privileges.
 - Verify written bytes by default; an explicit skip produces a visible **Not verified** result.
 
-The release manifest should grow immutable versioned image URLs, compressed and uncompressed
-sizes, and a raw-image SHA-256 before the privileged writer is enabled.
+Release manifest v2 supplies immutable versioned image URLs, compressed and uncompressed sizes,
+and hashes for both representations while retaining the v1 fields used by existing clients.
 
 ## Target safety
 
@@ -28,9 +34,23 @@ sizes, and a raw-image SHA-256 before the privileged writer is enabled.
 - Linux queries removable whole devices in `/sys/block`.
 - Windows queries USB/SD disks and rejects `IsBoot` and `IsSystem` disks.
 - Device identifiers are syntax-checked before they can cross the worker boundary.
-- The worker must re-enumerate the target immediately before writing and compare its stable
-  identity and capacity with the user's selection.
+- macOS carries the whole-media `IORegistryEntryID` captured at selection into the worker, then
+  re-enumerates immediately before writing and after opening the raw descriptor. Device path,
+  capacity, I/O Registry identity, media identity, and physical/external safety flags must match.
 - Cancellation is checked between every buffered read/write operation.
+- Once a target has been unmounted, all failure and cancellation paths attempt a safe eject.
+- Closing the GUI during an operation requests a safe stop and waits for the worker to finish.
+
+## Privilege boundary
+
+- Raw-device mode requires an explicit root-only environment gate and the exact worker CLI shape.
+- The elevated launcher copies the signed `.app` to a root-owned temporary directory and verifies
+  the SnapDog Developer ID designated requirement before executing its embedded worker binary.
+- Job, image, progress, cancel, and skip paths must be fixed-name members of one private session
+  directory with expected ownership, permissions, link count, file size, and stable directory
+  identity. The progress descriptor is revalidated before root truncates it.
+- Monitoring errors request cancellation and still wait for the authorization/worker process to
+  exit, so temporary cancellation state is not removed while a root worker could remain active.
 
 ## Packaging
 

@@ -22,11 +22,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
@@ -47,9 +45,11 @@ codegen-units = 1
 strip = true
 
 # wayland-scanner 0.31.10 still pins quick-xml 0.39, which is affected by
-# RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Pin the upstream fix until 0.31.11 ships.
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Keep its released, API-compatible
+# source locally with only the upstream quick-xml 0.41 manifest change until
+# a compatible crates.io release ships.
 [patch.crates-io]
-wayland-scanner = { git = "https://github.com/Smithay/wayland-rs.git", rev = "a55c54b4e138e29181d63908ece06fd2a13550a0" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -25,7 +25,13 @@ pub fn removable_drives() -> Result<Vec<Drive>, DriveError> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn macos_stable_disk_id(value: &str) -> Option<(&str, u64)> {
+    platform::split_stable_identifier(value)
+}
+
+#[cfg(target_os = "macos")]
 mod platform {
+    use std::collections::BTreeMap;
     use std::process::Command;
 
     use serde::Deserialize;
@@ -48,6 +54,16 @@ mod platform {
         size: Option<u64>,
     }
 
+    #[derive(Deserialize)]
+    struct IoMedia {
+        #[serde(rename = "BSD Name")]
+        bsd_name: Option<String>,
+        #[serde(rename = "IORegistryEntryID")]
+        registry_entry_id: Option<u64>,
+        #[serde(rename = "Whole")]
+        whole: Option<bool>,
+    }
+
     pub(super) fn removable_drives() -> Result<Vec<Drive>, DriveError> {
         let output = Command::new("/usr/sbin/diskutil")
             .args(["list", "-plist", "external", "physical"])
@@ -57,10 +73,47 @@ mod platform {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             ));
         }
-        parse_diskutil(&output.stdout)
+        let registry_entries = media_registry_entries()?;
+        parse_diskutil(&output.stdout, &registry_entries)
     }
 
-    fn parse_diskutil(bytes: &[u8]) -> Result<Vec<Drive>, DriveError> {
+    fn media_registry_entries() -> Result<BTreeMap<String, u64>, DriveError> {
+        let output = Command::new("/usr/sbin/ioreg")
+            .args(["-r", "-c", "IOMedia", "-a"])
+            .output()?;
+        if !output.status.success() {
+            return Err(DriveError::InvalidData(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        parse_ioreg(&output.stdout)
+    }
+
+    fn parse_ioreg(bytes: &[u8]) -> Result<BTreeMap<String, u64>, DriveError> {
+        let entries: Vec<IoMedia> =
+            plist::from_bytes(bytes).map_err(|error| DriveError::InvalidData(error.to_string()))?;
+        let mut identities = BTreeMap::new();
+        for entry in entries {
+            let (Some(name), Some(registry_entry_id)) = (entry.bsd_name, entry.registry_entry_id)
+            else {
+                continue;
+            };
+            if entry.whole != Some(true) || !valid_identifier(&name) || registry_entry_id == 0 {
+                continue;
+            }
+            if identities.insert(name.clone(), registry_entry_id).is_some() {
+                return Err(DriveError::InvalidData(format!(
+                    "duplicate I/O Registry identity for {name}"
+                )));
+            }
+        }
+        Ok(identities)
+    }
+
+    fn parse_diskutil(
+        bytes: &[u8],
+        registry_entries: &BTreeMap<String, u64>,
+    ) -> Result<Vec<Drive>, DriveError> {
         let list: DiskList =
             plist::from_bytes(bytes).map_err(|error| DriveError::InvalidData(error.to_string()))?;
         Ok(list
@@ -71,13 +124,14 @@ mod platform {
                 if !valid_identifier(&disk.id) {
                     return None;
                 }
+                let registry_entry_id = registry_entries.get(&disk.id)?;
                 let name = disk
                     .name
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| "Removable drive".to_owned());
                 Some(Drive {
                     device: format!("/dev/{}", disk.id),
-                    id: disk.id,
+                    id: format_stable_identifier(&disk.id, *registry_entry_id),
                     name,
                     capacity: size,
                 })
@@ -91,12 +145,29 @@ mod platform {
         })
     }
 
+    fn format_stable_identifier(disk_id: &str, registry_entry_id: u64) -> String {
+        format!("{disk_id}@{registry_entry_id}")
+    }
+
+    pub(super) fn split_stable_identifier(value: &str) -> Option<(&str, u64)> {
+        let (disk_id, registry_entry_id) = value.split_once('@')?;
+        if !valid_identifier(disk_id)
+            || registry_entry_id.is_empty()
+            || !registry_entry_id.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let registry_entry_id = registry_entry_id.parse().ok()?;
+        (registry_entry_id != 0).then_some((disk_id, registry_entry_id))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
         #[test]
         fn parses_external_physical_disk() {
+            let registry_entries = BTreeMap::from([("disk7".to_owned(), 4_242)]);
             let document = br#"<?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
             <plist version="1.0"><dict><key>AllDisksAndPartitions</key><array><dict>
@@ -104,10 +175,31 @@ mod platform {
             <key>MediaName</key><string>SD Card Reader</string>
             <key>Size</key><integer>31900000000</integer>
             </dict></array></dict></plist>"#;
-            let drives = parse_diskutil(document).unwrap();
+            let drives = parse_diskutil(document, &registry_entries).unwrap();
             assert_eq!(drives.len(), 1);
             assert_eq!(drives[0].device, "/dev/disk7");
+            assert_eq!(drives[0].id, "disk7@4242");
             assert_eq!(drives[0].name, "SD Card Reader");
+        }
+
+        #[test]
+        fn parses_whole_media_registry_identity() {
+            let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><array>
+            <dict><key>BSD Name</key><string>disk7</string>
+            <key>IORegistryEntryID</key><integer>4242</integer>
+            <key>Whole</key><true/></dict>
+            <dict><key>BSD Name</key><string>disk7s1</string>
+            <key>IORegistryEntryID</key><integer>4243</integer>
+            <key>Whole</key><false/></dict>
+            </array></plist>"#;
+            let identities = parse_ioreg(document).unwrap();
+            assert_eq!(identities, BTreeMap::from([("disk7".to_owned(), 4_242)]));
+            assert_eq!(
+                split_stable_identifier("disk7@4242"),
+                Some(("disk7", 4_242))
+            );
+            assert_eq!(split_stable_identifier("disk7s1@4242"), None);
         }
 
         #[test]
