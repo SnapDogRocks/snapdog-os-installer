@@ -36,10 +36,11 @@ identity prevents a remove/reinsert race from redirecting a queued job.
 - macOS uses a Developer ID-verified privileged copy, `diskutil`, and I/O Registry media identity.
 - Linux uses PolicyKit, kernel `diskseq`, sysfs device identity, and mount/swap/holder protection.
   Linux kernel 5.15 or newer is required so path reuse can be detected without an unsafe fallback.
-- Windows uses trusted System32 PowerShell modules plus UAC, requires positive SD/MMC or removable
-  USB identity, and verifies through sector-aligned unbuffered reads after an exclusive
+- Windows uses native COM/WMI and Win32 storage APIs plus UAC, requires positive SD/MMC or
+  removable USB identity, and verifies through sector-aligned unbuffered reads after an exclusive
   write-through physical-disk write. Boot, system, read-only, fixed, and ambiguous USB disks are
-  rejected.
+  rejected. No command shell participates in discovery, authorization, dismount, writing, or
+  verification.
 
 The automated tests use ordinary temporary files and never open a real device. See
 [Architecture and safety model](docs/architecture.md) for the complete boundary and failure model,

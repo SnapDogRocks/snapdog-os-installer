@@ -4,23 +4,16 @@
 //!
 //! Elevation and validation of the worker-job/session files are deliberately handled by the
 //! parent worker integration. This module owns only physical-disk identity validation and the
-//! destructive disk operations. Every `PowerShell` program is a source-code constant; values are
-//! passed as separate process arguments and are never interpolated into program text.
+//! destructive disk operations through native Windows handles and storage control codes.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::process::CommandExt;
-use std::process::Stdio;
 
 use aligned_vec::{AVec, RuntimeAlign};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{
-    WorkerDrive, WorkerError, WorkerPlatform, WorkerTarget, compare_drive,
-    windows_powershell_command,
-};
+use super::{WorkerDrive, WorkerError, WorkerPlatform, WorkerTarget, compare_drive};
 
 const PHYSICAL_DRIVE_PREFIX: &str = r"\\.\PHYSICALDRIVE";
 const STABLE_ID_VERSION: &str = "windows-disk-v2";
@@ -28,305 +21,9 @@ const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
 const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 const FILE_SHARE_READ: u32 = 0x1;
 const FILE_SHARE_WRITE: u32 = 0x2;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const MAX_POWERSHELL_OUTPUT: usize = 64 * 1024;
 const VERIFICATION_BUFFER_SIZE: usize = 1024 * 1024;
-const DISK_NUMBER_ENV: &str = "SNAPDOG_DISK_NUMBER";
-const DISK_SIZE_ENV: &str = "SNAPDOG_DISK_SIZE";
-const DISK_LOGICAL_SECTOR_ENV: &str = "SNAPDOG_DISK_LOGICAL_SECTOR";
-const DISK_PHYSICAL_SECTOR_ENV: &str = "SNAPDOG_DISK_PHYSICAL_SECTOR";
-const DISK_PATH_ENV: &str = "SNAPDOG_DISK_PATH";
-const DISK_UNIQUE_ID_ENV: &str = "SNAPDOG_DISK_UNIQUE_ID";
-const DISK_SERIAL_ENV: &str = "SNAPDOG_DISK_SERIAL";
-const DISK_BUS_ENV: &str = "SNAPDOG_DISK_BUS";
-const DISK_REMOVABLE_MEDIA_ENV: &str = "SNAPDOG_DISK_REMOVABLE_MEDIA";
-const ACCESS_PATHS_ENV: &str = "SNAPDOG_ACCESS_PATHS_JSON";
 
-const QUERY_DISK_SCRIPT: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
-Import-Module -Name $env:SNAPDOG_CIM_MODULE -Force -ErrorAction Stop
-if ($args.Count -ne 0) { throw 'Invalid disk query arguments' }
-$number = [uint32]$env:SNAPDOG_DISK_NUMBER
-$disks = @(Get-Disk -Number $number -ErrorAction Stop)
-if ($disks.Count -ne 1) { throw 'Expected exactly one physical disk' }
-$disk = $disks[0]
-$cimMatches = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop | Where-Object {
-    [uint32]$_.Index -eq $number
-})
-$supportsRemovableMedia = $false
-if ($cimMatches.Count -eq 1) {
-    $supportsRemovableMedia = @($cimMatches[0].Capabilities) -contains [uint16]7
-}
-[pscustomobject]@{
-    Number = [uint32]$disk.Number
-    Path = [string]$disk.Path
-    UniqueId = [string]$disk.UniqueId
-    SerialNumber = [string]$disk.SerialNumber
-    Size = [uint64]$disk.Size
-    LogicalSectorSize = [uint32]$disk.LogicalSectorSize
-    PhysicalSectorSize = [uint32]$disk.PhysicalSectorSize
-    IsBoot = [bool]$disk.IsBoot
-    IsSystem = [bool]$disk.IsSystem
-    IsOffline = [bool]$disk.IsOffline
-    IsReadOnly = [bool]$disk.IsReadOnly
-    BusType = [string]$disk.BusType
-    SupportsRemovableMedia = [bool]$supportsRemovableMedia
-} | ConvertTo-Json -Compress
-";
-
-const QUERY_ACCESS_PATHS_SCRIPT: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
-if ($args.Count -ne 0) { throw 'Invalid access-path query arguments' }
-$number = [uint32]$env:SNAPDOG_DISK_NUMBER
-$items = [System.Collections.Generic.List[object]]::new()
-foreach ($partition in @(Get-Partition -DiskNumber $number -ErrorAction Stop)) {
-    foreach ($accessPath in @($partition.AccessPaths)) {
-        $path = [string]$accessPath
-        if ([string]::IsNullOrWhiteSpace($path) -or $path -like '\\?\Volume{*}\') {
-            continue
-        }
-        $items.Add([pscustomobject]@{
-            PartitionNumber = [uint32]$partition.PartitionNumber
-            AccessPath = $path
-        })
-    }
-}
-ConvertTo-Json -InputObject @($items) -Compress
-";
-
-const DISMOUNT_VOLUMES_SCRIPT: &str = r#"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
-Import-Module -Name $env:SNAPDOG_CIM_MODULE -Force -ErrorAction Stop
-if ($args.Count -ne 0) { throw 'Invalid volume-dismount arguments' }
-$number = [uint32]$env:SNAPDOG_DISK_NUMBER
-$expectedSize = [uint64]$env:SNAPDOG_DISK_SIZE
-$expectedLogicalSector = [uint32]$env:SNAPDOG_DISK_LOGICAL_SECTOR
-$expectedPhysicalSector = [uint32]$env:SNAPDOG_DISK_PHYSICAL_SECTOR
-$expectedPath = [string]$env:SNAPDOG_DISK_PATH
-$expectedUniqueId = [string]$env:SNAPDOG_DISK_UNIQUE_ID
-$expectedSerial = [string]$env:SNAPDOG_DISK_SERIAL
-$expectedBus = [string]$env:SNAPDOG_DISK_BUS
-$expectedRemovableText = [string]$env:SNAPDOG_DISK_REMOVABLE_MEDIA
-if (@('0', '1') -cnotcontains $expectedRemovableText) {
-    throw 'Invalid removable-media expectation'
-}
-$expectedRemovableMedia = $expectedRemovableText -ceq '1'
-$disks = @(Get-Disk -Number $number -ErrorAction Stop)
-if ($disks.Count -ne 1) { throw 'Expected exactly one physical disk' }
-$disk = $disks[0]
-$path = ([string]$disk.Path).Trim()
-$uniqueId = ([string]$disk.UniqueId).Trim()
-$serial = ([string]$disk.SerialNumber).Trim()
-$bus = ([string]$disk.BusType).Trim().ToUpperInvariant()
-$cimMatches = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop | Where-Object {
-    [uint32]$_.Index -eq $number
-})
-$supportsRemovableMedia = $false
-if ($cimMatches.Count -eq 1) {
-    $supportsRemovableMedia = @($cimMatches[0].Capabilities) -contains [uint16]7
-}
-$isCardTarget = (@('SD', 'MMC') -ccontains $bus) -or ($bus -ceq 'USB' -and $supportsRemovableMedia)
-if ([uint64]$disk.Size -ne $expectedSize -or
-    [uint32]$disk.LogicalSectorSize -ne $expectedLogicalSector -or
-    [uint32]$disk.PhysicalSectorSize -ne $expectedPhysicalSector -or
-    $path -cne $expectedPath -or
-    $uniqueId -cne $expectedUniqueId -or
-    $serial -cne $expectedSerial -or
-    $bus -cne $expectedBus -or
-    $supportsRemovableMedia -ne $expectedRemovableMedia -or
-    [bool]$disk.IsBoot -or [bool]$disk.IsSystem -or [bool]$disk.IsOffline -or
-    [bool]$disk.IsReadOnly -or
-    -not $isCardTarget) {
-    throw 'Physical disk identity or safety properties changed'
-}
-
-$expectedAccessPaths = @(ConvertFrom-Json -InputObject ([string]$env:SNAPDOG_ACCESS_PATHS_JSON) -ErrorAction Stop)
-$currentAccessPaths = [System.Collections.Generic.List[object]]::new()
-$partitions = @(Get-Partition -DiskNumber $number -ErrorAction Stop)
-foreach ($partition in $partitions) {
-    foreach ($accessPath in @($partition.AccessPaths)) {
-        $candidate = [string]$accessPath
-        if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate -like '\\?\Volume{*}\') {
-            continue
-        }
-        $currentAccessPaths.Add([pscustomobject]@{
-            PartitionNumber = [uint32]$partition.PartitionNumber
-            AccessPath = $candidate
-        })
-    }
-}
-if ($currentAccessPaths.Count -ne $expectedAccessPaths.Count) {
-    throw 'Target access paths changed before dismount'
-}
-foreach ($current in $currentAccessPaths) {
-    $matches = @($expectedAccessPaths | Where-Object {
-        [uint32]$_.PartitionNumber -eq [uint32]$current.PartitionNumber -and
-        [string]$_.AccessPath -ceq [string]$current.AccessPath
-    })
-    if ($matches.Count -ne 1) { throw 'Target access paths changed before dismount' }
-}
-
-# Remove every user-mode access path first. Win32_Volume.Dismount(Permanent=true) documents status
-# 2 when mount points remain. Volume GUID paths are identities, not removable access paths, and the
-# Storage provider explicitly rejects attempts to remove them.
-$volumePaths = [System.Collections.Generic.List[string]]::new()
-$removedAccessPaths = [System.Collections.Generic.List[object]]::new()
-try {
-    foreach ($partition in $partitions) {
-        $volumes = @($partition | Get-Volume -ErrorAction SilentlyContinue)
-        foreach ($volume in $volumes) {
-            $volumePath = ([string]$volume.Path).TrimEnd('\')
-            if (-not [string]::IsNullOrWhiteSpace($volumePath)) {
-                $volumePaths.Add($volumePath)
-            }
-        }
-        foreach ($accessPath in @($partition.AccessPaths)) {
-            $path = [string]$accessPath
-            if ([string]::IsNullOrWhiteSpace($path) -or $path -like '\\?\Volume{*}\') {
-                continue
-            }
-            Remove-PartitionAccessPath -DiskNumber $number -PartitionNumber ([uint32]$partition.PartitionNumber) -AccessPath $path -Confirm:$false -ErrorAction Stop
-            $removedAccessPaths.Add([pscustomobject]@{
-                PartitionNumber = [uint32]$partition.PartitionNumber
-                AccessPath = $path
-            })
-        }
-    }
-
-    # Win32_Volume.Dismount requests the filesystem lock before dismounting. Never force-close
-    # application handles. Status 3 means this removable filesystem cannot promise no-automount;
-    # retry a temporary dismount, which is safe because Rust immediately requires ShareMode=0.
-    $win32Volumes = @(Get-CimInstance -ClassName Win32_Volume -ErrorAction Stop)
-    foreach ($volumePath in @($volumePaths | Sort-Object -Unique)) {
-        $matches = @($win32Volumes | Where-Object {
-            ([string]$_.DeviceID).TrimEnd('\') -ieq $volumePath
-        })
-        if ($matches.Count -ne 1) {
-            throw "Could not identify target volume $volumePath"
-        }
-        $result = Invoke-CimMethod -InputObject $matches[0] -MethodName Dismount -Arguments @{
-            Force = $false
-            Permanent = $true
-        } -ErrorAction Stop
-        $status = [uint32]$result.ReturnValue
-        if ($status -eq 3) {
-            $result = Invoke-CimMethod -InputObject $matches[0] -MethodName Dismount -Arguments @{
-                Force = $false
-                Permanent = $false
-            } -ErrorAction Stop
-            $status = [uint32]$result.ReturnValue
-        }
-        switch ($status) {
-            0 { continue }
-            1 { throw 'Access denied while dismounting a target volume' }
-            2 { throw 'A target volume still has an access path' }
-            3 { throw 'A target volume does not support dismounting' }
-            4 { throw 'A target volume is busy; close Explorer and other applications using it, then retry' }
-            default { throw "Target-volume dismount failed with status $status" }
-        }
-    }
-} catch {
-    # No write has occurred. Best-effort restoration avoids hiding a drive letter after a clean,
-    # fail-closed busy-volume error. The original exception remains the reported failure.
-    for ($index = $removedAccessPaths.Count - 1; $index -ge 0; $index--) {
-        $removed = $removedAccessPaths[$index]
-        try {
-            Add-PartitionAccessPath -DiskNumber $number -PartitionNumber ([uint32]$removed.PartitionNumber) -AccessPath ([string]$removed.AccessPath) -ErrorAction Stop
-        } catch {}
-    }
-    throw
-}
-"#;
-
-const RESTORE_ACCESS_PATHS_SCRIPT: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
-Import-Module -Name $env:SNAPDOG_CIM_MODULE -Force -ErrorAction Stop
-if ($args.Count -ne 0) { throw 'Invalid access-path restore arguments' }
-$number = [uint32]$env:SNAPDOG_DISK_NUMBER
-$expectedSize = [uint64]$env:SNAPDOG_DISK_SIZE
-$expectedLogicalSector = [uint32]$env:SNAPDOG_DISK_LOGICAL_SECTOR
-$expectedPhysicalSector = [uint32]$env:SNAPDOG_DISK_PHYSICAL_SECTOR
-$expectedPath = [string]$env:SNAPDOG_DISK_PATH
-$expectedUniqueId = [string]$env:SNAPDOG_DISK_UNIQUE_ID
-$expectedSerial = [string]$env:SNAPDOG_DISK_SERIAL
-$expectedBus = [string]$env:SNAPDOG_DISK_BUS
-$expectedRemovableText = [string]$env:SNAPDOG_DISK_REMOVABLE_MEDIA
-if (@('0', '1') -cnotcontains $expectedRemovableText) {
-    throw 'Invalid removable-media expectation'
-}
-$expectedRemovableMedia = $expectedRemovableText -ceq '1'
-$disks = @(Get-Disk -Number $number -ErrorAction Stop)
-if ($disks.Count -ne 1) { throw 'Expected exactly one physical disk' }
-$disk = $disks[0]
-$path = ([string]$disk.Path).Trim()
-$uniqueId = ([string]$disk.UniqueId).Trim()
-$serial = ([string]$disk.SerialNumber).Trim()
-$bus = ([string]$disk.BusType).Trim().ToUpperInvariant()
-$cimMatches = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop | Where-Object {
-    [uint32]$_.Index -eq $number
-})
-$supportsRemovableMedia = $false
-if ($cimMatches.Count -eq 1) {
-    $supportsRemovableMedia = @($cimMatches[0].Capabilities) -contains [uint16]7
-}
-$isCardTarget = (@('SD', 'MMC') -ccontains $bus) -or ($bus -ceq 'USB' -and $supportsRemovableMedia)
-if ([uint64]$disk.Size -ne $expectedSize -or
-    [uint32]$disk.LogicalSectorSize -ne $expectedLogicalSector -or
-    [uint32]$disk.PhysicalSectorSize -ne $expectedPhysicalSector -or
-    $path -cne $expectedPath -or
-    $uniqueId -cne $expectedUniqueId -or
-    $serial -cne $expectedSerial -or
-    $bus -cne $expectedBus -or
-    $supportsRemovableMedia -ne $expectedRemovableMedia -or
-    [bool]$disk.IsBoot -or [bool]$disk.IsSystem -or [bool]$disk.IsOffline -or
-    [bool]$disk.IsReadOnly -or
-    -not $isCardTarget) {
-    throw 'Physical disk identity or safety properties changed before rollback'
-}
-
-$entries = @(ConvertFrom-Json -InputObject ([string]$env:SNAPDOG_ACCESS_PATHS_JSON) -ErrorAction Stop)
-foreach ($entry in $entries) {
-    $partitionNumber = [uint32]$entry.PartitionNumber
-    $accessPath = [string]$entry.AccessPath
-    if ($partitionNumber -eq 0 -or [string]::IsNullOrWhiteSpace($accessPath) -or
-        $accessPath.Contains([char]0)) {
-        throw 'Invalid access-path rollback record'
-    }
-    $partitions = @(Get-Partition -DiskNumber $number -PartitionNumber $partitionNumber -ErrorAction Stop)
-    if ($partitions.Count -ne 1) { throw 'Rollback partition is no longer unique' }
-    $alreadyPresent = @($partitions[0].AccessPaths) | Where-Object { [string]$_ -ceq $accessPath }
-    if (@($alreadyPresent).Count -eq 0) {
-        Add-PartitionAccessPath -DiskNumber $number -PartitionNumber $partitionNumber -AccessPath $accessPath -ErrorAction Stop
-    }
-}
-";
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoolFlag(bool);
 
 impl BoolFlag {
@@ -335,8 +32,7 @@ impl BoolFlag {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DiskSnapshot {
     number: u32,
     path: String,
@@ -353,30 +49,7 @@ struct DiskSnapshot {
     supports_removable_media: BoolFlag,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct RemovedAccessPath {
-    partition_number: u32,
-    access_path: String,
-}
-
-impl RemovedAccessPath {
-    fn is_valid(&self) -> bool {
-        self.partition_number > 0
-            && !self.access_path.trim().is_empty()
-            && self.access_path.len() <= 32_767
-            && !self.access_path.contains('\0')
-    }
-}
-
 impl DiskSnapshot {
-    fn normalize(&mut self) {
-        self.path = self.path.trim().to_owned();
-        self.unique_id = self.unique_id.trim().to_owned();
-        self.serial_number = self.serial_number.trim().to_owned();
-        self.bus_type = self.bus_type.trim().to_ascii_uppercase();
-    }
-
     fn fingerprint(&self) -> Result<String, WorkerError> {
         if self.path.is_empty()
             || (self.unique_id.is_empty() && self.serial_number.is_empty())
@@ -420,34 +93,6 @@ impl DiskSnapshot {
             "USB" => self.supports_removable_media.is_set(),
             _ => false,
         }
-    }
-
-    fn helper_environment(&self) -> [(String, String); 9] {
-        [
-            (DISK_NUMBER_ENV.to_owned(), self.number.to_string()),
-            (DISK_SIZE_ENV.to_owned(), self.size.to_string()),
-            (
-                DISK_LOGICAL_SECTOR_ENV.to_owned(),
-                self.logical_sector_size.to_string(),
-            ),
-            (
-                DISK_PHYSICAL_SECTOR_ENV.to_owned(),
-                self.physical_sector_size.to_string(),
-            ),
-            (DISK_PATH_ENV.to_owned(), self.path.clone()),
-            (DISK_UNIQUE_ID_ENV.to_owned(), self.unique_id.clone()),
-            (DISK_SERIAL_ENV.to_owned(), self.serial_number.clone()),
-            (DISK_BUS_ENV.to_owned(), self.bus_type.clone()),
-            (
-                DISK_REMOVABLE_MEDIA_ENV.to_owned(),
-                if self.supports_removable_media.is_set() {
-                    "1"
-                } else {
-                    "0"
-                }
-                .to_owned(),
-            ),
-        ]
     }
 }
 
@@ -697,7 +342,7 @@ pub struct WindowsPlatform {
     post_write_pin: Option<File>,
     post_write_identity: Option<PostWriteIdentity>,
     rollback_snapshot: Option<DiskSnapshot>,
-    removed_access_paths: Vec<RemovedAccessPath>,
+    locked_volumes: Option<crate::windows_native::LockedVolumes>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -744,8 +389,7 @@ impl WindowsPlatform {
         if current != *expected {
             return Err(WorkerError::TargetChanged);
         }
-        restore_access_paths(&current, &self.removed_access_paths)?;
-        self.removed_access_paths.clear();
+        drop(self.locked_volumes.take());
         self.rollback_snapshot = None;
         self.post_write_identity = None;
         self.volumes_dismounted = false;
@@ -767,7 +411,7 @@ impl WorkerPlatform for WindowsPlatform {
         if self.prepared_target.is_some()
             || self.volumes_dismounted
             || self.write_may_have_started
-            || !self.removed_access_paths.is_empty()
+            || self.locked_volumes.is_some()
         {
             return Err(WorkerError::UnsafeTarget);
         }
@@ -782,22 +426,17 @@ impl WorkerPlatform for WindowsPlatform {
         let pinned_snapshot = query_disk(identity.number)?;
         validate_snapshot(selected, &identity, &pinned_snapshot, Some(false))?;
         self.post_write_identity = Some(PostWriteIdentity::from(&pinned_snapshot));
-        self.rollback_snapshot = Some(pinned_snapshot.clone());
-        let removed_access_paths = match query_access_paths(&pinned_snapshot) {
-            Ok(paths) => paths,
+        self.rollback_snapshot = Some(pinned_snapshot);
+        let locked_volumes = match crate::windows_native::lock_and_dismount_volumes(identity.number)
+        {
+            Ok(handles) => handles,
             Err(error) => {
                 self.post_write_identity = None;
                 self.rollback_snapshot = None;
-                return Err(error);
+                return Err(WorkerError::Platform(error.to_string()));
             }
         };
-        self.removed_access_paths = removed_access_paths;
-        if let Err(error) = dismount_volumes(&pinned_snapshot, &self.removed_access_paths) {
-            // The helper rolls paths back on failure, but retain the pre-mutation journal and mark
-            // cleanup pending so a failed best-effort restoration can be retried by `eject`.
-            self.volumes_dismounted = true;
-            return Err(error);
-        }
+        self.locked_volumes = Some(locked_volumes);
         self.volumes_dismounted = true;
         drop(device_pin);
 
@@ -819,7 +458,7 @@ impl WorkerPlatform for WindowsPlatform {
             return match self.rollback_unmount(selected) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(WorkerError::Platform(format!(
-                    "{error}; Windows access-path rollback also failed: {rollback}"
+                    "{error}; Windows volume-lock cleanup also failed: {rollback}"
                 ))),
             };
         }
@@ -848,7 +487,6 @@ impl WorkerPlatform for WindowsPlatform {
         );
         self.write_may_have_started = true;
         self.rollback_snapshot = None;
-        self.removed_access_paths.clear();
         Ok(WindowsTarget::new(target))
     }
 
@@ -908,14 +546,11 @@ impl WorkerPlatform for WindowsPlatform {
         validate_post_write_snapshot(selected, &identity, &snapshot, post_write_identity)?;
         drop(self.post_write_pin.take());
 
-        let device_pin = open_device_pin(&identity.device)?;
+        if self.locked_volumes.is_none() {
+            return Err(WorkerError::UnsafeTarget);
+        }
         let pinned = query_disk(identity.number)?;
         validate_post_write_snapshot(selected, &identity, &pinned, post_write_identity)?;
-        let access_paths = query_access_paths(&pinned)?;
-        dismount_volumes(&pinned, &access_paths)?;
-        let dismounted = query_disk(identity.number)?;
-        validate_post_write_snapshot(selected, &identity, &dismounted, post_write_identity)?;
-        drop(device_pin);
 
         // Reacquiring an exclusive handle proves that the freshly written partition table did not
         // race an automatic mount. Closing that handle after WRITE_THROUGH flushing leaves the
@@ -925,6 +560,7 @@ impl WorkerPlatform for WindowsPlatform {
             .sync_all()
             .map_err(|error| WorkerError::Platform(error.to_string()))?;
         drop(proof);
+        drop(self.locked_volumes.take());
         self.volumes_dismounted = true;
         self.write_may_have_started = true;
         Ok(())
@@ -932,62 +568,28 @@ impl WorkerPlatform for WindowsPlatform {
 }
 
 fn query_disk(number: u32) -> Result<DiskSnapshot, WorkerError> {
-    let environment = [(DISK_NUMBER_ENV.to_owned(), number.to_string())];
-    let mut snapshot = parse_snapshot(&run_powershell(QUERY_DISK_SCRIPT, &environment)?)?;
-    snapshot.normalize();
-    Ok(snapshot)
-}
-
-fn query_access_paths(snapshot: &DiskSnapshot) -> Result<Vec<RemovedAccessPath>, WorkerError> {
-    let output = run_powershell(QUERY_ACCESS_PATHS_SCRIPT, &snapshot.helper_environment())?;
-    let paths: Vec<RemovedAccessPath> = serde_json::from_slice(&output).map_err(|error| {
-        WorkerError::Platform(format!(
-            "Windows returned invalid access-path inventory data: {error}"
-        ))
+    let disk = crate::windows_native::query_disk(number).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            WorkerError::TargetMissing
+        } else {
+            WorkerError::Platform(error.to_string())
+        }
     })?;
-    if paths.iter().any(|path| !path.is_valid()) {
-        return Err(WorkerError::Platform(
-            "Windows returned an unsafe access-path rollback record".to_owned(),
-        ));
-    }
-    Ok(paths)
-}
-
-fn dismount_volumes(
-    snapshot: &DiskSnapshot,
-    paths: &[RemovedAccessPath],
-) -> Result<(), WorkerError> {
-    let json =
-        serde_json::to_string(paths).map_err(|error| WorkerError::Platform(error.to_string()))?;
-    if json.len() > MAX_POWERSHELL_OUTPUT {
-        return Err(WorkerError::Platform(
-            "Windows access-path inventory exceeded the safety limit".to_owned(),
-        ));
-    }
-    let mut environment = snapshot.helper_environment().to_vec();
-    environment.push((ACCESS_PATHS_ENV.to_owned(), json));
-    run_powershell(DISMOUNT_VOLUMES_SCRIPT, &environment)?;
-    Ok(())
-}
-
-fn restore_access_paths(
-    snapshot: &DiskSnapshot,
-    paths: &[RemovedAccessPath],
-) -> Result<(), WorkerError> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let json =
-        serde_json::to_string(paths).map_err(|error| WorkerError::Platform(error.to_string()))?;
-    if json.len() > MAX_POWERSHELL_OUTPUT {
-        return Err(WorkerError::Platform(
-            "Windows access-path rollback data exceeded the safety limit".to_owned(),
-        ));
-    }
-    let mut environment = snapshot.helper_environment().to_vec();
-    environment.push((ACCESS_PATHS_ENV.to_owned(), json));
-    run_powershell(RESTORE_ACCESS_PATHS_SCRIPT, &environment)?;
-    Ok(())
+    Ok(DiskSnapshot {
+        number: disk.number,
+        path: disk.path,
+        unique_id: disk.unique_id,
+        serial_number: disk.serial_number,
+        size: disk.size,
+        logical_sector_size: disk.logical_sector_size,
+        physical_sector_size: disk.physical_sector_size,
+        is_boot: BoolFlag(disk.is_boot),
+        is_system: BoolFlag(disk.is_system),
+        is_offline: BoolFlag(disk.is_offline),
+        is_read_only: BoolFlag(disk.is_read_only),
+        bus_type: disk.bus_type,
+        supports_removable_media: BoolFlag(disk.supports_removable_media),
+    })
 }
 
 fn open_device_pin(device: &str) -> Result<File, WorkerError> {
@@ -1026,14 +628,6 @@ fn device_open_error(error: &io::Error) -> WorkerError {
     ))
 }
 
-fn parse_snapshot(bytes: &[u8]) -> Result<DiskSnapshot, WorkerError> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        WorkerError::Platform(format!(
-            "Windows returned invalid physical-disk data: {error}"
-        ))
-    })
-}
-
 fn validate_snapshot(
     selected: &WorkerDrive,
     identity: &SelectedDisk,
@@ -1060,7 +654,8 @@ fn validate_post_write_snapshot(
     snapshot: &DiskSnapshot,
     expected: &PostWriteIdentity,
 ) -> Result<(), WorkerError> {
-    // A raw image may replace the disk signature/GPT GUID represented by Get-Disk.UniqueId, so
+    // A raw image may replace the disk signature/GPT GUID represented by the storage provider's
+    // `UniqueId`, so
     // the pre-write fingerprint is intentionally not required after the exclusive handle closes.
     // The hardware-facing path and serial remain stable, however, and prevent a same-size medium
     // swapped onto the same PhysicalDrive number from being taken offline after the write.
@@ -1114,38 +709,6 @@ fn valid_sector_geometry(size: u64, logical: u32, physical: u32) -> bool {
         && (logical..=65_536).contains(&physical)
         && physical.is_power_of_two()
         && size.is_multiple_of(u64::from(logical))
-}
-
-fn run_powershell(program: &str, environment: &[(String, String)]) -> Result<Vec<u8>, WorkerError> {
-    let output = windows_powershell_command()?
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            program,
-        ])
-        .envs(environment.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| WorkerError::Platform(error.to_string()))?;
-    if output.stdout.len() > MAX_POWERSHELL_OUTPUT || output.stderr.len() > MAX_POWERSHELL_OUTPUT {
-        return Err(WorkerError::Platform(
-            "Windows disk helper output exceeded the safety limit".to_owned(),
-        ));
-    }
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(WorkerError::Platform(if message.is_empty() {
-            format!("Windows disk helper failed with status {}", output.status)
-        } else {
-            message
-        }));
-    }
-    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -1304,94 +867,8 @@ mod tests {
     }
 
     #[test]
-    fn dismount_helper_locks_volumes_without_set_disk_or_dynamic_source() {
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Win32_Volume"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("-MethodName Dismount"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Remove-PartitionAccessPath"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Add-PartitionAccessPath"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Force = $false"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Permanent = $true"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Permanent = $false"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("if ($status -eq 3)"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("4 { throw"));
-        assert!(!DISMOUNT_VOLUMES_SCRIPT.contains("Force = $true"));
-        assert!(!DISMOUNT_VOLUMES_SCRIPT.contains("Set-Disk"));
-        assert!(!DISMOUNT_VOLUMES_SCRIPT.contains("Invoke-Expression"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("SNAPDOG_STORAGE_MODULE"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("SNAPDOG_CIM_MODULE"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("$env:PSModulePath = ''"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("Capabilities) -contains [uint16]7"));
-        assert!(DISMOUNT_VOLUMES_SCRIPT.contains("SNAPDOG_ACCESS_PATHS_JSON"));
-        assert!(QUERY_ACCESS_PATHS_SCRIPT.contains("Get-Partition"));
-        assert!(RESTORE_ACCESS_PATHS_SCRIPT.contains("Add-PartitionAccessPath"));
-        assert!(!RESTORE_ACCESS_PATHS_SCRIPT.contains("Invoke-Expression"));
+    fn native_backend_keeps_unbuffered_verification() {
         assert_eq!(FILE_FLAG_NO_BUFFERING, 0x2000_0000);
-    }
-
-    #[test]
-    fn snapshot_helper_environment_has_fixed_order_and_shape() {
-        let environment = snapshot().helper_environment();
-        assert_eq!(environment[0], (DISK_NUMBER_ENV.to_owned(), "7".to_owned()));
-        assert_eq!(environment[1].1, "32000000000");
-        assert_eq!(environment[2].1, "512");
-        assert_eq!(environment[3].1, "4096");
-        assert_eq!(environment[7].1, "USB");
-        assert_eq!(environment[8].1, "1");
-    }
-
-    #[test]
-    fn parses_fixed_shape_powershell_json() {
-        let json = br#"{
-            "Number":7,
-            "Path":"  \\\\?\\usbstor#disk  ",
-            "UniqueId":" MEDIA-1234 ",
-            "SerialNumber":" SERIAL-5678 ",
-            "Size":32000000000,
-            "LogicalSectorSize":512,
-            "PhysicalSectorSize":4096,
-            "IsBoot":false,
-            "IsSystem":false,
-            "IsOffline":true,
-            "IsReadOnly":false,
-            "BusType":" usb ",
-            "SupportsRemovableMedia":true
-        }"#;
-        let mut parsed = parse_snapshot(json).unwrap();
-        parsed.normalize();
-        assert_eq!(parsed.path, r"\\?\usbstor#disk");
-        assert_eq!(parsed.unique_id, "MEDIA-1234");
-        assert_eq!(parsed.serial_number, "SERIAL-5678");
-        assert_eq!(parsed.bus_type, "USB");
-        assert!(parsed.supports_removable_media.is_set());
-        assert!(valid_sector_geometry(
-            parsed.size,
-            parsed.logical_sector_size,
-            parsed.physical_sector_size
-        ));
-    }
-
-    #[test]
-    fn rollback_records_reject_ambiguous_values() {
-        assert!(
-            RemovedAccessPath {
-                partition_number: 1,
-                access_path: "E:\\".to_owned(),
-            }
-            .is_valid()
-        );
-        assert!(
-            !RemovedAccessPath {
-                partition_number: 0,
-                access_path: "E:\\".to_owned(),
-            }
-            .is_valid()
-        );
-        assert!(
-            !RemovedAccessPath {
-                partition_number: 1,
-                access_path: "bad\0path".to_owned(),
-            }
-            .is_valid()
-        );
+        assert_eq!(FILE_FLAG_WRITE_THROUGH, 0x8000_0000);
     }
 }

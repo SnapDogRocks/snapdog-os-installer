@@ -8,6 +8,8 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(all(debug_assertions, target_os = "macos"))]
+use std::sync::Mutex;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::fs::{self, File};
@@ -31,12 +33,9 @@ use snapdog_os_installer::worker::{
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let worker_reentry =
+        std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(WORKER_JOB_ARGUMENT));
+    init_tracing(worker_reentry)?;
 
     if let Some(job_path) = worker_job_path(std::env::args_os().skip(1))? {
         return run_worker(&job_path);
@@ -46,14 +45,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn init_tracing(worker_reentry: bool) -> io::Result<()> {
+    let filter = if cfg!(debug_assertions) {
+        // A machine-level `RUST_LOG` must not silently suppress the diagnostics this explicitly
+        // instrumented build exists to collect.
+        tracing_subscriber::EnvFilter::new("snapdog_os_installer=debug,info")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    if !worker_reentry {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("HOME is unavailable for the debug log"))?;
+        let directory = home.join("Library/Logs/SnapDog OS Installer");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("debug.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_writer(Mutex::new(file))
+            .try_init()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        tracing::info!(log_path = %path.display(), "debug logging initialized");
+        return Ok(());
+    }
+
+    let _ = worker_reentry;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .try_init()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
 fn run_gui() -> eframe::Result {
     let icon = load_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SnapDog OS Installer")
-            .with_inner_size([1040.0, 640.0])
-            .with_min_inner_size([1040.0, 640.0])
-            .with_max_inner_size([1040.0, 640.0])
+            .with_inner_size([1040.0, 620.0])
+            .with_min_inner_size([1040.0, 620.0])
+            .with_max_inner_size([1040.0, 620.0])
             .with_resizable(false)
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,

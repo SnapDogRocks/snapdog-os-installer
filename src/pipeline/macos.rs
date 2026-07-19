@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! macOS elevation and progress monitoring for the privileged worker.
+//! macOS authorization and progress monitoring for the isolated worker.
 
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
@@ -17,76 +19,43 @@ use super::{
 };
 use crate::worker::{WORKER_JOB_SHA256_ARGUMENT, WorkerProgress};
 use sha2::{Digest, Sha256};
+use unix_ancillary::UnixStreamExt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_PROGRESS_READ: u64 = 1024 * 1024;
 const MAX_PROGRESS_RECORD: usize = 64 * 1024;
 const MAX_HELPER_STDERR: u64 = 256 * 1024;
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
+#[cfg(not(debug_assertions))]
 const WORKER_REQUIREMENT: &str = r#"identifier "cc.snapdog.os-installer" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "898G35U5LW""#;
 const WORKER_RELATIVE_PATH: &str = "Contents/MacOS/snapdog-os-installer";
-const ELEVATED_SHELL_PROGRAM: &str = r#"set -eu
-source_bundle=$1
-worker_argument=$2
-job_path=$3
-job_sha256_argument=$4
-expected_job_sha256=$5
-expected_executable_sha256=$6
-requirement=$7
-if [ "$worker_argument" != "--worker-job" ] ||
-   [ "$job_sha256_argument" != "--worker-job-sha256" ] ||
-   [ "${#expected_job_sha256}" -ne 64 ] ||
-   [ "${#expected_executable_sha256}" -ne 64 ]; then
-  echo 'Invalid SnapDog worker argument contract' >&2
-  exit 64
-fi
-worker_root=$(/usr/bin/mktemp -d /private/tmp/snapdog-installer-worker.XXXXXX)
-trap '/bin/rm -rf "$worker_root"' EXIT HUP INT TERM
-worker_bundle="$worker_root/worker.app"
-/usr/bin/ditto --noqtn "$source_bundle" "$worker_bundle"
-/usr/sbin/chown -R root:wheel "$worker_bundle"
-/usr/bin/codesign --verify --deep --strict "-R=$requirement" "$worker_bundle"
-worker_executable="$worker_bundle/Contents/MacOS/snapdog-os-installer"
-actual_executable_sha256=$(/usr/bin/shasum -a 256 "$worker_executable")
-actual_executable_sha256=${actual_executable_sha256%% *}
-if [ "$actual_executable_sha256" != "$expected_executable_sha256" ]; then
-  echo 'SnapDog executable changed during administrator authorization' >&2
-  exit 1
-fi
-/usr/bin/env SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE=YES-I-UNDERSTAND \
-  "$worker_executable" "$worker_argument" "$job_path" \
-  "$job_sha256_argument" "$expected_job_sha256"
-"#;
-// Values originating outside this source file are passed in argv and quoted by AppleScript.
-// Never interpolate a path into this program text.
-const ELEVATION_SCRIPT: &str = r#"
-on run argv
-    if (count of argv) is not 8 then error "Invalid worker launch arguments"
-    set bundlePath to item 1 of argv
-    set workerArgument to item 2 of argv
-    set jobPath to item 3 of argv
-    set jobSha256Argument to item 4 of argv
-    set expectedJobSha256 to item 5 of argv
-    set expectedExecutableSha256 to item 6 of argv
-    set shellProgram to item 7 of argv
-    set requirement to item 8 of argv
-    set shellCommand to "/bin/sh -c " & quoted form of shellProgram & " -- " & quoted form of bundlePath & " " & quoted form of workerArgument & " " & quoted form of jobPath & " " & quoted form of jobSha256Argument & " " & quoted form of expectedJobSha256 & " " & quoted form of expectedExecutableSha256 & " " & quoted form of requirement
-    do shell script shellCommand with administrator privileges
-end run
-"#;
+const RAW_DEVICE_OPT_IN: &str = "SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE";
+const RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
+const AUTHOPEN: &str = "/usr/libexec/authopen";
+// Darwin O_RDWR | O_SYNC. Raw disks reject File::sync_all/F_FULLFSYNC with ENOTTY, so the
+// descriptor itself must provide synchronous file-integrity writes.
+const AUTHOPEN_RAW_FLAGS: &str = "130";
+const TARGET_FD_REQUEST: &[u8] = b"SNAPDOG_TARGET_FD_REQUEST_V1\n";
+const TARGET_FD_RESPONSE: &[u8] = b"SNAPDOG_TARGET_FD_RESPONSE_V1\n";
 
-/// Launches the current application binary as a root worker through the native macOS prompt.
+/// Launches the current application binary as an isolated, unprivileged worker.
 #[derive(Clone, Debug)]
 pub struct MacOsWorkerRunner {
     bundle: PathBuf,
 }
 
 impl MacOsWorkerRunner {
-    /// Use the currently running executable for the privileged worker re-entry.
+    /// Use the currently running executable for the isolated worker re-entry.
     pub fn current() -> Result<Self, WorkerRunnerError> {
         let executable = std::env::current_exe()?;
         let bundle = bundle_for_executable(&executable)?;
+        #[cfg(not(debug_assertions))]
         verify_signed_bundle(&bundle)?;
+        #[cfg(debug_assertions)]
+        tracing::warn!(
+            bundle = %bundle.display(),
+            "DEBUG BUILD: signed bundle verification is disabled"
+        );
         Ok(Self { bundle })
     }
 
@@ -96,6 +65,53 @@ impl MacOsWorkerRunner {
     pub const fn with_bundle(bundle: PathBuf) -> Self {
         Self { bundle }
     }
+
+    /// Ask macOS for scoped removable-volume access before launching the worker.
+    ///
+    /// TCC attributes access to the responsible GUI process. A non-destructive `open(2)` attempt
+    /// from that process triggers the native Removable Volumes prompt; the subsequently spawned
+    /// worker then inherits the decision. The open itself is expected to fail for an unprivileged
+    /// process, and the descriptor is immediately closed if it happens to succeed. Authorization
+    /// to write is granted later for the exact raw device through `authopen`.
+    pub fn prime_removable_volume_access(&self, device: &str) -> Result<(), WorkerRunnerError> {
+        let raw_path = raw_device_path(device)?;
+        match OpenOptions::new().read(true).write(true).open(&raw_path) {
+            Ok(file) => {
+                tracing::info!(
+                    raw_path = %raw_path.display(),
+                    "primed macOS removable-volume access"
+                );
+                drop(file);
+            }
+            Err(error) => {
+                // EPERM/EACCES is the normal result after TCC has presented its prompt because the
+                // GUI remains unprivileged. EBUSY is also normal while volumes are still mounted.
+                // `authopen` performs the authoritative open after unmounting.
+                tracing::info!(
+                    raw_path = %raw_path.display(),
+                    error = %error,
+                    "macOS removable-volume access primer completed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn raw_device_path(device: &str) -> Result<PathBuf, WorkerRunnerError> {
+    let Some(identifier) = device.strip_prefix("/dev/disk") else {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "macOS target must be a whole-disk device",
+        )));
+    };
+    if identifier.is_empty() || !identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "macOS target must be a whole-disk device",
+        )));
+    }
+    Ok(PathBuf::from(format!("/dev/rdisk{identifier}")))
 }
 
 impl WorkerRunner for MacOsWorkerRunner {
@@ -108,7 +124,14 @@ impl WorkerRunner for MacOsWorkerRunner {
         let pinned = PinnedLaunchFiles::open(&executable, launch.job_path)?;
         let launch_identity = pinned.identity;
         let mut tail = ProgressTail::open(launch.progress_path)?;
-        let mut process = ElevatedProcess::spawn(&self.bundle, launch.job_path, pinned)?;
+        let mut target_listener =
+            AuthorizedTargetListener::bind(launch.macos_target_socket.ok_or_else(|| {
+                WorkerRunnerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "macOS authorized target socket is missing",
+                ))
+            })?)?;
+        let mut process = WorkerProcess::spawn(&executable, launch.job_path, pinned)?;
         let mut monitor_error = None;
         let mut cancellation_sent = false;
 
@@ -138,10 +161,8 @@ impl WorkerRunner for MacOsWorkerRunner {
                 {
                     monitor_error = Some(WorkerRunnerError::Io(error));
                 }
-                // Before the worker emits its first event, the only process we can be waiting on
-                // is normally the macOS authorization dialog. Killing osascript dismisses that
-                // dialog. If startup raced, the already-created marker makes the worker stop at
-                // its first safe boundary while this runner still waits for process completion.
+                // If startup raced, the already-created marker makes the worker stop at its first
+                // safe boundary while this runner still waits for process completion.
                 if !tail.saw_event()
                     && let Err(error) = process.request_stop()
                     && monitor_error.is_none()
@@ -151,11 +172,20 @@ impl WorkerRunner for MacOsWorkerRunner {
                 cancellation_sent = true;
             }
 
+            if monitor_error.is_none()
+                && let Err(error) = target_listener.try_serve(launch.target_device)
+            {
+                let _ = touch_marker(launch.cancel_path);
+                let _ = process.request_stop();
+                monitor_error = Some(error);
+            }
+
             let exited = match process.try_wait() {
                 Ok(status) => status.is_some(),
                 Err(error) => {
                     let _ = touch_marker(launch.cancel_path);
                     let (status, stderr) = process.finish()?;
+                    log_helper_stderr(&stderr);
                     return Err(WorkerRunnerError::Failed {
                         status: status.to_string(),
                         message: format!("{error}; {}", stderr_message(&stderr)),
@@ -169,21 +199,119 @@ impl WorkerRunner for MacOsWorkerRunner {
                     monitor_error = Some(error);
                 }
                 let (status, stderr) = process.finish()?;
+                log_helper_stderr(&stderr);
                 if let Some(error) = monitor_error {
                     return Err(error);
                 }
                 if status.success() {
                     return Ok(());
                 }
+                let message = stderr_message(&stderr);
                 return Err(WorkerRunnerError::Failed {
                     status: status.to_string(),
-                    message: stderr_message(&stderr),
+                    message,
                 });
             }
 
             thread::sleep(POLL_INTERVAL);
         }
     }
+}
+
+struct AuthorizedTargetListener {
+    listener: UnixListener,
+    path: PathBuf,
+    served: bool,
+}
+
+impl AuthorizedTargetListener {
+    fn bind(path: &Path) -> Result<Self, WorkerRunnerError> {
+        if !path.is_absolute() || path.exists() {
+            return Err(WorkerRunnerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "macOS authorized target socket path is invalid",
+            )));
+        }
+        let listener = UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            path: path.to_path_buf(),
+            served: false,
+        })
+    }
+
+    fn try_serve(&mut self, device: &str) -> Result<(), WorkerRunnerError> {
+        if self.served {
+            return Ok(());
+        }
+        let (mut stream, _) = match self.listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        stream.set_nonblocking(false)?;
+        let mut request = [0_u8; TARGET_FD_REQUEST.len()];
+        stream.read_exact(&mut request)?;
+        if request != TARGET_FD_REQUEST {
+            return Err(WorkerRunnerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker sent an invalid target descriptor request",
+            )));
+        }
+
+        let target = authorized_raw_target(device)?;
+        let sent = stream.send_fds(TARGET_FD_RESPONSE, &[&target])?;
+        if sent != TARGET_FD_RESPONSE.len() {
+            return Err(WorkerRunnerError::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "authorized target descriptor response was incomplete",
+            )));
+        }
+        stream.flush()?;
+        self.served = true;
+        tracing::info!(device, "passed authopen target descriptor to macOS worker");
+        Ok(())
+    }
+}
+
+impl Drop for AuthorizedTargetListener {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn authorized_raw_target(device: &str) -> Result<File, WorkerRunnerError> {
+    let raw_path = raw_device_path(device)?;
+    let (auth_socket, child_socket) = UnixStream::pair()?;
+    let child_socket_fd = OwnedFd::from(child_socket);
+    tracing::info!(raw_path = %raw_path.display(), "requesting authorized raw target descriptor");
+    let child = Command::new(AUTHOPEN)
+        .arg("-stdoutpipe")
+        .arg("-o")
+        .arg(AUTHOPEN_RAW_FLAGS)
+        .arg(&raw_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_socket_fd))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let descriptor_result = auth_socket.recv_fds::<1>();
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(WorkerRunnerError::Failed {
+            status: output.status.to_string(),
+            message: stderr_message(&output.stderr),
+        });
+    }
+    let mut descriptor_message = descriptor_result?;
+    if descriptor_message.data.is_empty() || descriptor_message.fds.len() != 1 {
+        return Err(WorkerRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authopen did not return exactly one target descriptor",
+        )));
+    }
+    Ok(File::from(descriptor_message.fds.remove(0)))
 }
 
 fn stderr_message(stderr: &[u8]) -> String {
@@ -195,11 +323,18 @@ fn stderr_message(stderr: &[u8]) -> String {
     }
 }
 
+fn log_helper_stderr(stderr: &[u8]) {
+    for line in String::from_utf8_lossy(stderr).lines() {
+        if !line.trim().is_empty() {
+            tracing::debug!(worker = line, "macOS worker diagnostic");
+        }
+    }
+}
+
 struct PinnedLaunchFiles {
     _executable: File,
     _job: File,
     identity: LaunchIdentity,
-    executable_sha256: String,
     job_sha256: String,
 }
 
@@ -214,7 +349,6 @@ impl PinnedLaunchFiles {
                 executable: executable.identity,
                 job: job.identity,
             },
-            executable_sha256: executable.sha256,
             job_sha256: job.sha256,
         })
     }
@@ -352,36 +486,36 @@ impl FileIdentity {
             Ok(())
         } else {
             Err(WorkerRunnerError::Io(io::Error::other(
-                "launch file changed during administrator authorization",
+                "launch file changed during worker startup",
             )))
         }
     }
 }
 
-struct ElevatedProcess {
+struct WorkerProcess {
     child: Option<Child>,
     stderr_reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
     _pins: PinnedLaunchFiles,
 }
 
-impl ElevatedProcess {
+impl WorkerProcess {
     fn spawn(
-        bundle: &Path,
+        executable: &Path,
         job_path: &Path,
         pins: PinnedLaunchFiles,
     ) -> Result<Self, WorkerRunnerError> {
-        let mut child = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(ELEVATION_SCRIPT)
-            .arg("--")
-            .arg(bundle)
+        tracing::info!(
+            executable = %executable.display(),
+            job_path = %job_path.display(),
+            debug_unsigned = cfg!(debug_assertions),
+            "launching isolated macOS worker"
+        );
+        let mut child = Command::new(executable)
             .arg(WORKER_JOB_ARGUMENT)
             .arg(job_path)
             .arg(WORKER_JOB_SHA256_ARGUMENT)
             .arg(&pins.job_sha256)
-            .arg(&pins.executable_sha256)
-            .arg(ELEVATED_SHELL_PROGRAM)
-            .arg(WORKER_REQUIREMENT)
+            .env(RAW_DEVICE_OPT_IN, RAW_DEVICE_OPT_IN_VALUE)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -390,7 +524,7 @@ impl ElevatedProcess {
             let _ = child.kill();
             let _ = child.wait();
             return Err(WorkerRunnerError::Io(io::Error::other(
-                "failed to capture osascript stderr",
+                "failed to capture worker stderr",
             )));
         };
         let stderr_reader = thread::spawn(move || {
@@ -442,7 +576,7 @@ impl ElevatedProcess {
     }
 }
 
-impl Drop for ElevatedProcess {
+impl Drop for WorkerProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -483,8 +617,7 @@ impl ProgressTail {
 
     fn drain(&mut self, progress: &mut dyn FnMut(WorkerProgress)) -> Result<(), WorkerRunnerError> {
         let mut chunk = Vec::new();
-        self.file
-            .by_ref()
+        Read::by_ref(&mut self.file)
             .take(MAX_PROGRESS_READ + 1)
             .read_to_end(&mut chunk)?;
         if chunk.len() as u64 > MAX_PROGRESS_READ {
@@ -572,6 +705,7 @@ fn bundle_for_executable(executable: &Path) -> Result<PathBuf, WorkerRunnerError
     Ok(bundle.to_path_buf())
 }
 
+#[cfg(not(debug_assertions))]
 fn verify_signed_bundle(bundle: &Path) -> Result<(), WorkerRunnerError> {
     let output = Command::new("/usr/bin/codesign")
         .arg("--verify")
@@ -594,7 +728,7 @@ fn verify_signed_bundle(bundle: &Path) -> Result<(), WorkerRunnerError> {
 mod tests {
     use std::io::Write;
 
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::NamedTempFile;
 
     use super::*;
     use crate::worker::{WORKER_PROGRESS_SCHEMA_VERSION, WorkerPhase};
@@ -612,27 +746,30 @@ mod tests {
     }
 
     #[test]
-    fn elevation_script_quotes_every_dynamic_argument() {
-        assert!(ELEVATION_SCRIPT.contains("on run argv"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of bundlePath"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of workerArgument"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of jobPath"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of jobSha256Argument"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of expectedJobSha256"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of expectedExecutableSha256"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of shellProgram"));
-        assert!(ELEVATION_SCRIPT.contains("quoted form of requirement"));
-        assert!(ELEVATION_SCRIPT.contains("with administrator privileges"));
-        assert!(
-            ELEVATED_SHELL_PROGRAM
-                .contains("SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE=YES-I-UNDERSTAND")
+    fn removable_volume_primer_accepts_only_whole_disk_devices() {
+        assert_eq!(
+            raw_device_path("/dev/disk21").unwrap(),
+            PathBuf::from("/dev/rdisk21")
         );
-        assert!(ELEVATED_SHELL_PROGRAM.contains("codesign --verify --deep --strict"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("\"-R=$requirement\""));
-        assert!(!ELEVATED_SHELL_PROGRAM.contains("--requirement"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("/usr/bin/shasum -a 256"));
-        assert!(ELEVATED_SHELL_PROGRAM.contains("$job_sha256_argument"));
-        assert!(!ELEVATION_SCRIPT.contains("$(touch /tmp/injected)"));
+        for invalid in [
+            "/dev/disk21s1",
+            "/dev/rdisk21",
+            "/tmp/disk21",
+            "/dev/disk21;touch /tmp/injected",
+        ] {
+            assert!(raw_device_path(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_worker_contract_uses_an_explicit_opt_in() {
+        assert_eq!(
+            RAW_DEVICE_OPT_IN,
+            "SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE"
+        );
+        assert_eq!(RAW_DEVICE_OPT_IN_VALUE, "YES-I-UNDERSTAND");
+        assert_eq!(WORKER_RELATIVE_PATH, "Contents/MacOS/snapdog-os-installer");
+        assert_eq!(AUTHOPEN_RAW_FLAGS, "130");
     }
 
     #[test]
@@ -648,31 +785,6 @@ mod tests {
         );
         fs::write(file.path(), b"replaced SnapDog job").unwrap();
         assert!(pinned.identity.ensure_unchanged(file.path()).is_err());
-    }
-
-    #[test]
-    fn elevation_programs_parse_without_execution() {
-        assert!(
-            Command::new("/bin/sh")
-                .args(["-n", "-c", ELEVATED_SHELL_PROGRAM])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let directory = tempdir().unwrap();
-        let compiled = directory.path().join("elevation.scpt");
-        let output = Command::new("/usr/bin/osacompile")
-            .arg("-e")
-            .arg(ELEVATION_SCRIPT)
-            .arg("-o")
-            .arg(compiled)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     #[test]

@@ -101,7 +101,12 @@ packaging_requirement = re.search(
 )
 assert packaging_requirement is not None
 assert runtime_requirement.group(1) == packaging_requirement.group(1)
-assert '"-R=$requirement"' in macos_pipeline
+assert 'Command::new("/usr/bin/osascript")' not in macos_pipeline
+assert "ELEVATION_SCRIPT" not in macos_pipeline
+assert "ELEVATED_SHELL_PROGRAM" not in macos_pipeline
+assert ".env(RAW_DEVICE_OPT_IN, RAW_DEVICE_OPT_IN_VALUE)" in macos_pipeline
+assert "Command::new(executable)" in macos_pipeline
+assert '.arg(AUTHOPEN_RAW_FLAGS)' in macos_pipeline
 assert '.arg("--requirement")' not in macos_pipeline
 assert '"-R=$WORKER_REQUIREMENT"' in macos_packager
 assert "umask 077" in macos_packager
@@ -110,6 +115,7 @@ assert 'mv -f "$UNVALIDATED_DMG" "$DMG"' in macos_packager
 
 build_script = (root / "build.rs").read_text()
 assert 'CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")' in build_script
+assert 'requestedExecutionLevel level=\"asInvoker\"' in build_script
 
 windows_packager = (root / "scripts/package-windows.ps1").read_text()
 static_windows_flags = "-Dwarnings -C target-feature=+crt-static"
@@ -120,6 +126,24 @@ assert "Move-Item -Force -LiteralPath $TemporaryOutput -Destination $Output" in 
 for runtime_name in ("vcruntime", "msvcp", "msvcr", "concrt", "ucrtbase", "api-ms-win-crt-"):
     assert runtime_name in windows_packager.lower()
 
+windows_runtime_paths = (
+    "src/drives.rs",
+    "src/pipeline/windows.rs",
+    "src/worker.rs",
+    "src/worker/windows.rs",
+    "src/windows_native.rs",
+)
+windows_runtime = "\n".join((root / path).read_text() for path in windows_runtime_paths)
+for forbidden in ("powershell", "start-process", "get-disk", "set-disk"):
+    assert forbidden not in windows_runtime.lower()
+for required in (
+    "ShellExecuteExW",
+    "FSCTL_LOCK_VOLUME",
+    "FSCTL_DISMOUNT_VOLUME",
+    "IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS",
+):
+    assert required in windows_runtime
+
 for workflow in ("ci.yml", "release.yml"):
     workflow_text = (root / ".github/workflows" / workflow).read_text()
     assert static_windows_flags in workflow_text
@@ -128,6 +152,10 @@ info = plistlib.loads((root / "packaging/macos/Info.plist").read_bytes())
 assert info["CFBundleIdentifier"] == "cc.snapdog.os-installer"
 assert info["CFBundleExecutable"] == "snapdog-os-installer"
 assert info["CFBundleShortVersionString"] == "__VERSION__"
+assert info["NSRemovableVolumesUsageDescription"] == (
+    "SnapDog OS Installer needs access to removable volumes to write and verify "
+    "SnapDog OS on the selected SD card."
+)
 assert info["CFBundleVersion"] == "__VERSION__"
 
 entitlements = plistlib.loads(
@@ -152,6 +180,7 @@ assert png_dimensions(root / "packaging/linux/cc.snapdog.os-installer.png") == (
     512,
 )
 assert png_dimensions(root / "assets/icon.png") == (1024, 1024)
+assert png_dimensions(root / "assets/icon-macos.png") == (1024, 1024)
 assert png_dimensions(root / "assets/dmg/background.png") == (600, 400)
 assert (root / "assets/icon.icns").read_bytes()[:4] == b"icns"
 assert (root / "assets/icon.ico").read_bytes()[:4] == b"\x00\x00\x01\x00"

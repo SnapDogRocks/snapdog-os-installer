@@ -52,12 +52,13 @@ confirm the exact medium before each destructive run.
 ## Windows
 
 - Test both native x86-64 and ARM64 packages on supported Windows 11 hardware.
-- Confirm UAC names SnapDog OS Installer (and the verified publisher once Azure signing is enabled),
-  not PowerShell.
+- Confirm UAC names SnapDog OS Installer (and the verified publisher once Azure signing is enabled).
 - Test native SD/MMC readers and USB readers whose physical device reports removable-media
   capability. Ordinary USB HDDs/SSDs and readers exposed only as fixed media must not appear.
-- Confirm every target volume dismounts without `Set-Disk -IsOffline`, busy volumes fail closed, and
-  the exclusive write-through PhysicalDrive handle succeeds on a normal removable SD card.
+- Confirm native WMI discovery works on stock Windows without loading shell modules. Confirm every
+  target volume is resolved through disk extents, locked and dismounted through storage control
+  codes, busy volumes fail closed, and the exclusive write-through PhysicalDrive handle succeeds
+  on a normal removable SD card.
 - Confirm verification uses sector-aligned, unbuffered reads and detects deliberate post-write
   corruption, including an image whose byte length is not a whole physical sector.
 - Confirm `dumpbin /dependents` reports no dynamic VC/UCRT redistributable dependency for either

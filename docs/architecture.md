@@ -51,15 +51,16 @@ Platform identity:
 - **Linux:** `/sys/block` must report a writable removable whole block device with a positive kernel
   `diskseq`. Device numbers, partitions, transitive holders, protected mounts, and swap are checked;
   the opened block descriptor is revalidated against sysfs before writing.
-- **Windows:** `Get-Disk` must report a writable, online SD/MMC device, or a USB device whose
-  physical-drive capabilities positively identify removable media. Ordinary USB HDDs and SSDs are
-  excluded even when externally attached. A fingerprint binds disk number, capacity, logical and
-  physical sector geometry, bus, device path, unique ID, serial number, and removable capability.
-  User access paths are removed without force-closing application handles, target volumes are
-  dismounted, and the physical drive is then opened exclusively with write-through semantics.
-  Verification reopens the target with unbuffered, sector-aligned reads. The implementation never
-  uses `Set-Disk -IsOffline`; access-path restoration is attempted only when dismount fails before
-  a write begins.
+- **Windows:** the Storage Management WMI provider must report a writable, online SD/MMC device, or
+  a USB device whose `Win32_DiskDrive` capabilities positively identify removable media. Ordinary
+  USB HDDs and SSDs are excluded even when externally attached. A fingerprint binds disk number,
+  capacity, logical and physical sector geometry, bus, device path, unique ID, serial number, and
+  removable capability. Native volume enumeration and disk-extent IOCTLs identify the target's
+  filesystems; each volume is locked and dismounted with `FSCTL_LOCK_VOLUME` and
+  `FSCTL_DISMOUNT_VOLUME`, and the physical drive is then opened exclusively with write-through
+  semantics. Verification reopens the target with unbuffered, sector-aligned reads. The locked
+  volume handles remain alive until cleanup, so a pre-write failure restores normal access simply
+  by closing them.
 
 ## Privilege boundary
 
@@ -80,9 +81,9 @@ Platform identity:
   designated requirement, and binds the worker job to a SHA-256 digest across the administrator
   prompt. Linux invokes a constant program through a validated, root-owned `pkexec`/`bash` toolchain;
   that program copies the pre-hashed executable into a private root-owned directory, verifies the
-  copy, and passes the digest-bound job to it. Windows resolves PowerShell and required modules from
-  trusted System32 locations, clears inherited environment state, and invokes UAC with a constant
-  program and separately quoted native arguments.
+  copy, and passes the digest-bound job to it. Windows invokes UAC directly through
+  `ShellExecuteExW`, with a constant executable and separately quoted native arguments. Discovery,
+  elevation, volume locking, dismount, writing, and verification never invoke a command shell.
 
 ## Tests and release gates
 

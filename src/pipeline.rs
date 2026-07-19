@@ -107,6 +107,8 @@ pub enum PipelineError {
 /// Failures while launching or monitoring a privileged worker.
 #[derive(Debug, Error)]
 pub enum WorkerRunnerError {
+    #[error("administrator authorization was cancelled or denied")]
+    AuthorizationDenied,
     #[error("worker process I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("worker emitted invalid JSON-lines progress: {0}")]
@@ -125,6 +127,8 @@ pub struct WorkerLaunch<'a> {
     pub cancel_path: &'a Path,
     pub skip_verification_path: &'a Path,
     pub cancelled: &'a AtomicBool,
+    pub target_device: &'a str,
+    pub macos_target_socket: Option<&'a Path>,
 }
 
 /// Injectable download boundary used by the real client and file-backed tests.
@@ -280,13 +284,15 @@ where
 {
     let run = control.begin()?;
     ensure_not_cancelled(control)?;
-    let temporary = TempDir::new()?;
+    let temporary = private_temporary_directory()?;
     let archive_path = temporary.path().join("snapdog-os.img.gz");
     let raw_path = temporary.path().join("snapdog-os.img");
     let job_path = temporary.path().join("worker-job.json");
     let progress_path = temporary.path().join("worker-progress.jsonl");
     let cancel_path = temporary.path().join("cancel");
     let skip_path = temporary.path().join("skip-verification");
+    let macos_target_socket =
+        cfg!(target_os = "macos").then(|| temporary.path().join("authorized-target.sock"));
 
     let download_request = DownloadRequest {
         url: &request.image_url,
@@ -316,22 +322,18 @@ where
     .map_err(map_preparation_error)?;
     ensure_not_cancelled(control)?;
     ensure_target_capacity(&prepared, &request.drive)?;
-    OpenOptions::new().write(true).open(&raw_path)?.sync_all()?;
+    sync_private_file(&raw_path)?;
 
     create_empty_file(&progress_path)?;
-    let worker_job = WorkerJob {
-        schema_version: WORKER_JOB_SCHEMA_VERSION,
-        drive: request.drive.clone(),
+    let worker_job = build_worker_job(
+        request,
+        &prepared,
         raw_path,
-        raw_size: prepared.bytes,
-        verify: request.verify,
-        expected_raw_sha256: prepared.raw_sha256.clone(),
-        progress: ProgressDestination::File {
-            path: progress_path.clone(),
-        },
-        cancel_path: Some(cancel_path.clone()),
-        skip_verification_path: Some(skip_path.clone()),
-    };
+        &progress_path,
+        &cancel_path,
+        &skip_path,
+        macos_target_socket,
+    );
     write_json(&job_path, &worker_job)?;
     run.register_markers(&cancel_path, &skip_path)?;
     ensure_not_cancelled(control)?;
@@ -342,6 +344,8 @@ where
         cancel_path: &cancel_path,
         skip_verification_path: &skip_path,
         cancelled: control.cancelled_flag(),
+        target_device: &worker_job.drive.device,
+        macos_target_socket: worker_job.macos_target_socket.as_deref(),
     };
     emit(PipelineEvent::AwaitingAuthorization);
     let mut terminal = None;
@@ -385,12 +389,51 @@ where
     })
 }
 
+fn build_worker_job(
+    request: &PipelineRequest,
+    prepared: &PreparedImage,
+    raw_path: PathBuf,
+    progress_path: &Path,
+    cancel_path: &Path,
+    skip_path: &Path,
+    macos_target_socket: Option<PathBuf>,
+) -> WorkerJob {
+    WorkerJob {
+        schema_version: WORKER_JOB_SCHEMA_VERSION,
+        drive: request.drive.clone(),
+        raw_path,
+        raw_size: prepared.bytes,
+        verify: request.verify,
+        expected_raw_sha256: prepared.raw_sha256.clone(),
+        progress: ProgressDestination::File {
+            path: progress_path.to_path_buf(),
+        },
+        cancel_path: Some(cancel_path.to_path_buf()),
+        skip_verification_path: Some(skip_path.to_path_buf()),
+        macos_target_socket,
+    }
+}
+
 fn ensure_not_cancelled(control: &PipelineControl) -> Result<(), PipelineError> {
     if control.is_cancelled() {
         Err(PipelineError::Cancelled)
     } else {
         Ok(())
     }
+}
+
+fn private_temporary_directory() -> Result<TempDir, io::Error> {
+    let directory = TempDir::new()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `TempDir::new` follows the process umask and can therefore create mode 0755. The
+        // privileged worker deliberately rejects such a session before opening any image or
+        // control file. Tighten the empty directory before those files are created.
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
 }
 
 fn map_download_error(error: DownloadError) -> PipelineError {
@@ -424,16 +467,21 @@ const fn ensure_target_capacity(
 }
 
 fn create_empty_file(path: &Path) -> Result<(), io::Error> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?
-        .sync_all()
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    set_private_file_permissions(&file)?;
+    file.sync_all()
+}
+
+fn sync_private_file(path: &Path) -> Result<(), io::Error> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    set_private_file_permissions(&file)?;
+    file.sync_all()
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PipelineError> {
     let encoded = serde_json::to_vec(value)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    set_private_file_permissions(&file)?;
     file.write_all(&encoded)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
@@ -442,10 +490,30 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PipelineError>
 
 fn touch_marker(path: &Path) -> Result<(), io::Error> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file.sync_all(),
+        Ok(file) => {
+            set_private_file_permissions(&file)?;
+            file.sync_all()
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &std::fs::File) -> Result<(), io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the no-op implementation preserves one fallible cross-platform call contract"
+)]
+const fn set_private_file_permissions(_file: &std::fs::File) -> Result<(), io::Error> {
+    Ok(())
 }
 
 pub(crate) fn validate_progress(progress: &WorkerProgress) -> Result<(), WorkerRunnerError> {
@@ -530,6 +598,20 @@ mod tests {
                 job.skip_verification_path.as_deref(),
                 Some(launch.skip_verification_path)
             );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let session = launch.job_path.parent().expect("session directory");
+                assert_eq!(fs::metadata(session)?.permissions().mode() & 0o7777, 0o700);
+                for path in [
+                    launch.job_path,
+                    launch.progress_path,
+                    job.raw_path.as_path(),
+                ] {
+                    assert_eq!(fs::metadata(path)?.permissions().mode() & 0o7777, 0o600);
+                }
+            }
 
             progress(worker_progress(WorkerPhase::Writing, None));
             progress(worker_progress(WorkerPhase::Verifying, None));
@@ -680,6 +762,18 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_session_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = private_temporary_directory().unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
     #[test]
     fn end_to_end_pipeline_writes_and_verifies_a_file_target() {
         let (archive, raw, request) = fixture();
@@ -779,5 +873,14 @@ mod tests {
         touch_marker(&marker).unwrap();
         touch_marker(&marker).unwrap();
         assert!(marker.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(marker).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+        }
     }
 }

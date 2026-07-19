@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Windows UAC elevation and progress monitoring for the privileged worker.
-//!
-//! The helper program is constant source text. Executable and job paths are always delivered as
-//! separate native process arguments; no dynamic value is interpolated into `PowerShell` source.
+//! Native Windows UAC elevation and progress monitoring for the privileged worker.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use super::{
@@ -31,30 +26,9 @@ use sha2::{Digest, Sha256};
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_PROGRESS_READ: u64 = 1024 * 1024;
 const MAX_PROGRESS_RECORD: usize = 64 * 1024;
-const MAX_HELPER_STDERR: u64 = 256 * 1024;
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const FILE_SHARE_READ: u32 = 0x1;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const ELEVATED_EXECUTABLE_ENV: &str = "SNAPDOG_ELEVATED_EXECUTABLE";
-const ELEVATED_ARGUMENTS_ENV: &str = "SNAPDOG_ELEVATED_ARGUMENTS";
-const ELEVATION_PROGRAM: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-if ($args.Count -ne 0) { throw 'Invalid worker launch arguments' }
-$executable = [string]$env:SNAPDOG_ELEVATED_EXECUTABLE
-$arguments = [string]$env:SNAPDOG_ELEVATED_ARGUMENTS
-if ([string]::IsNullOrWhiteSpace($executable) -or [string]::IsNullOrWhiteSpace($arguments)) {
-    throw 'Missing worker launch environment'
-}
-$process = Start-Process -FilePath $executable -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden -ErrorAction Stop
-if ($null -eq $process) { throw 'UAC did not return a worker process' }
-exit [int]$process.ExitCode
-";
 
 /// Launches this executable as an administrator through the Windows UAC prompt.
 #[derive(Clone, Debug)]
@@ -110,10 +84,9 @@ impl WorkerRunner for WindowsWorkerRunner {
                 {
                     monitor_error = Some(WorkerRunnerError::Io(error));
                 }
-                // Never kill the PowerShell/UAC launcher: once elevation has raced past the
-                // consent dialog, the elevated process is outside this process' security token
-                // and could be orphaned. The durable marker makes an accepted worker stop at its
-                // first safe boundary; a pending UAC prompt must be accepted or denied by the user.
+                // Never terminate the elevated process: it is outside this process' security
+                // token. The durable marker makes an accepted worker stop at its first safe
+                // boundary; a pending UAC prompt must be accepted or denied by the user.
                 cancellation_sent = true;
             }
 
@@ -121,10 +94,10 @@ impl WorkerRunner for WindowsWorkerRunner {
                 Ok(status) => status.is_some(),
                 Err(error) => {
                     let _ = touch_marker(launch.cancel_path);
-                    let (status, stderr) = process.finish()?;
+                    let status = process.finish()?;
                     return Err(WorkerRunnerError::Failed {
-                        status: status.to_string(),
-                        message: format!("{error}; {}", stderr_message(&stderr)),
+                        status: format!("exit code {status}"),
+                        message: error.to_string(),
                     });
                 }
             };
@@ -134,16 +107,16 @@ impl WorkerRunner for WindowsWorkerRunner {
                 {
                     monitor_error = Some(error);
                 }
-                let (status, stderr) = process.finish()?;
+                let status = process.finish()?;
                 if let Some(error) = monitor_error {
                     return Err(error);
                 }
-                if status.success() {
+                if status == 0 {
                     return Ok(());
                 }
                 return Err(WorkerRunnerError::Failed {
-                    status: status.to_string(),
-                    message: stderr_message(&stderr),
+                    status: format!("exit code {status}"),
+                    message: "the native elevated worker reported a failure".to_owned(),
                 });
             }
 
@@ -152,18 +125,8 @@ impl WorkerRunner for WindowsWorkerRunner {
     }
 }
 
-fn stderr_message(stderr: &[u8]) -> String {
-    let message = String::from_utf8_lossy(stderr).trim().to_owned();
-    if message.is_empty() {
-        "the Windows authorization helper returned no error details".to_owned()
-    } else {
-        message
-    }
-}
-
 struct ElevatedProcess {
-    child: Option<Child>,
-    stderr_reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    child: Option<crate::windows_native::ElevatedChild>,
     _pins: PinnedLaunchFiles,
 }
 
@@ -178,53 +141,14 @@ impl ElevatedProcess {
             OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_ARGUMENT),
             OsStr::new(WINDOWS_RAW_DEVICE_OPT_IN_VALUE),
         ]);
-        let mut command = crate::worker::windows_powershell_command()
-            .map_err(|error| WorkerRunnerError::Io(io::Error::other(error.to_string())))?;
-        let mut child = command
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                ELEVATION_PROGRAM,
-            ])
-            .env(ELEVATED_EXECUTABLE_ENV, executable)
-            .env(ELEVATED_ARGUMENTS_ENV, elevated_arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
-        let Some(mut stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(WorkerRunnerError::Io(io::Error::other(
-                "failed to capture PowerShell stderr",
-            )));
-        };
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr
-                .by_ref()
-                .take(MAX_HELPER_STDERR + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_HELPER_STDERR {
-                return Err(io::Error::other(
-                    "authorization helper error output is too large",
-                ));
-            }
-            Ok(bytes)
-        });
+        let child = crate::windows_native::launch_elevated(executable, &elevated_arguments)?;
         Ok(Self {
             child: Some(child),
-            stderr_reader: Some(stderr_reader),
             _pins: pins,
         })
     }
 
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>, WorkerRunnerError> {
+    fn try_wait(&mut self) -> Result<Option<u32>, WorkerRunnerError> {
         self.child
             .as_mut()
             .ok_or_else(missing_child)?
@@ -232,16 +156,10 @@ impl ElevatedProcess {
             .map_err(WorkerRunnerError::Io)
     }
 
-    fn finish(mut self) -> Result<(ExitStatus, Vec<u8>), WorkerRunnerError> {
-        let status = self.child.as_mut().ok_or_else(missing_child)?.wait()?;
+    fn finish(mut self) -> Result<u32, WorkerRunnerError> {
+        let status = self.child.as_ref().ok_or_else(missing_child)?.wait()?;
         self.child = None;
-        let stderr = self
-            .stderr_reader
-            .take()
-            .ok_or_else(missing_stderr_reader)?
-            .join()
-            .map_err(|_| missing_stderr_reader())??;
-        Ok((status, stderr))
+        Ok(status)
     }
 }
 
@@ -317,25 +235,13 @@ fn pin_regular_file(path: &Path, expected_size: Option<u64>) -> io::Result<File>
 
 impl Drop for ElevatedProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
-        }
+        drop(self.child.take());
     }
 }
 
 fn missing_child() -> WorkerRunnerError {
     WorkerRunnerError::Io(io::Error::other(
         "authorization helper process handle is unavailable",
-    ))
-}
-
-fn missing_stderr_reader() -> WorkerRunnerError {
-    WorkerRunnerError::Io(io::Error::other(
-        "authorization helper stderr monitor is unavailable",
     ))
 }
 
@@ -468,18 +374,6 @@ mod tests {
             verified: (phase == WorkerPhase::Completed).then_some(true),
             message: None,
         }
-    }
-
-    #[test]
-    fn elevation_program_uses_only_environment_data_and_elevates_the_installer() {
-        assert!(ELEVATION_PROGRAM.contains("if ($args.Count -ne 0)"));
-        assert!(ELEVATION_PROGRAM.contains("-Verb RunAs"));
-        assert!(ELEVATION_PROGRAM.contains("-PassThru -Wait"));
-        assert!(ELEVATION_PROGRAM.contains("-FilePath $executable"));
-        assert!(ELEVATION_PROGRAM.contains("-ArgumentList $arguments"));
-        assert!(!ELEVATION_PROGRAM.contains("powershell.exe' -ArgumentList"));
-        assert!(!ELEVATION_PROGRAM.contains("Invoke-Expression"));
-        assert!(!ELEVATION_PROGRAM.contains("Start-Process $args"));
     }
 
     #[test]

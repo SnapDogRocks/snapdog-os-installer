@@ -28,12 +28,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
+unix-ancillary = "0.2.2"
 wgpu = { version = "=27.0.1", default-features = false, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 aligned-vec = "=0.6.4"
-known-folders = "=1.4.2"
 same-file = "=1.0.6"
+wmi = { version = "=0.18.4", default-features = false }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -47,6 +61,18 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Local end-to-end diagnostics need release-like throughput for multi-gigabyte image preparation,
+# while retaining debug assertions so the unsigned macOS worker exception can never leak into a
+# normal release build.
+[profile.diagnostic]
+inherits = "release"
+debug = 1
+debug-assertions = true
+overflow-checks = true
+strip = false
+lto = false
+codegen-units = 16
+
 # wayland-scanner 0.31.10 still pins quick-xml 0.39, which is affected by
 # RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Keep its released, API-compatible
 # source locally with only the upstream quick-xml 0.41 manifest change until
@@ -55,7 +81,7 @@ strip = true
 wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

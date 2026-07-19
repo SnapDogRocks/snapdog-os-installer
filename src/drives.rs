@@ -30,6 +30,11 @@ pub(crate) fn macos_stable_disk_id(value: &str) -> Option<(&str, u64)> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn macos_removable_drive_by_stable_id(value: &str) -> Result<Option<Drive>, DriveError> {
+    platform::removable_drive_by_stable_id(value)
+}
+
+#[cfg(target_os = "macos")]
 mod platform {
     use std::collections::BTreeMap;
     use std::process::Command;
@@ -106,12 +111,56 @@ mod platform {
         parse_ioreg(&output.stdout)
     }
 
+    pub(super) fn removable_drive_by_stable_id(value: &str) -> Result<Option<Drive>, DriveError> {
+        let registry_entries = media_registry_entries()?;
+        let drive = registry_drive(value, &registry_entries);
+        tracing::debug!(
+            stable_id = value,
+            safe_media_count = registry_entries.len(),
+            found = drive.is_some(),
+            candidates = ?registry_entries.keys().collect::<Vec<_>>(),
+            "looked up removable medium by stable I/O Registry identity"
+        );
+        Ok(drive)
+    }
+
+    fn registry_drive(
+        value: &str,
+        registry_entries: &BTreeMap<String, SafeMedia>,
+    ) -> Option<Drive> {
+        let (disk_id, registry_entry_id) = split_stable_identifier(value)?;
+        let media = registry_entries.get(disk_id)?;
+        if media.registry_entry_id != registry_entry_id {
+            return None;
+        }
+        Some(Drive {
+            device: format!("/dev/{disk_id}"),
+            id: format_stable_identifier(disk_id, registry_entry_id),
+            name: media
+                .name
+                .clone()
+                .unwrap_or_else(|| "Removable drive".to_owned()),
+            capacity: media.size,
+        })
+    }
+
     fn parse_ioreg(bytes: &[u8]) -> Result<BTreeMap<String, SafeMedia>, DriveError> {
         let entries: Vec<IoMedia> =
             plist::from_bytes(bytes).map_err(|error| DriveError::InvalidData(error.to_string()))?;
         let mut identities = BTreeMap::new();
         let mut registry_ids = std::collections::BTreeSet::new();
         for entry in entries {
+            tracing::debug!(
+                bsd_name = entry.bsd_name.as_deref().unwrap_or("<none>"),
+                name = entry.name.as_deref().unwrap_or("<none>"),
+                registry_entry_id = ?entry.registry_entry_id,
+                size = ?entry.size,
+                whole = ?entry.whole,
+                writable = ?entry.writable,
+                removable = ?entry.removable,
+                ejectable = ?entry.ejectable,
+                "observed macOS IOMedia entry"
+            );
             let (Some(bsd_name), Some(registry_entry_id), Some(size)) =
                 (entry.bsd_name, entry.registry_entry_id, entry.size)
             else {
@@ -274,6 +323,27 @@ mod platform {
         }
 
         #[test]
+        fn stable_registry_identity_survives_a_diskutil_unmount() {
+            let registry_document = br#"<?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><array><dict>
+            <key>BSD Name</key><string>disk21</string>
+            <key>IORegistryEntryName</key><string>Apple SDXC Reader Media</string>
+            <key>IORegistryEntryID</key><integer>4242</integer>
+            <key>Size</key><integer>63864569856</integer>
+            <key>Whole</key><true/><key>Writable</key><true/>
+            <key>Removable</key><true/><key>Ejectable</key><true/>
+            </dict></array></plist>"#;
+            let identities = parse_ioreg(registry_document).unwrap();
+            let drive = registry_drive("disk21@4242", &identities).unwrap();
+
+            assert_eq!(drive.device, "/dev/disk21");
+            assert_eq!(drive.id, "disk21@4242");
+            assert_eq!(drive.capacity, 63_864_569_856);
+            assert_eq!(drive.name, "Apple SDXC Reader Media");
+            assert!(registry_drive("disk21@4243", &identities).is_none());
+        }
+
+        #[test]
         fn rejects_diskutil_and_registry_size_mismatch() {
             let registry_entries = BTreeMap::from([(
                 "disk7".to_owned(),
@@ -403,57 +473,14 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::os::windows::process::CommandExt;
-
-    use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     use super::{Drive, DriveError};
+    use crate::windows_native::DiskRecord;
 
     const STABLE_ID_VERSION: &str = "windows-disk-v2";
     const PHYSICAL_DRIVE_PREFIX: &str = r"\\.\PHYSICALDRIVE";
-    const MAX_POWERSHELL_OUTPUT: usize = 1024 * 1024;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const QUERY_DISKS_SCRIPT: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Import-Module -Name $env:SNAPDOG_STORAGE_MODULE -Force -ErrorAction Stop
-Import-Module -Name $env:SNAPDOG_CIM_MODULE -Force -ErrorAction Stop
-$cimDisks = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop)
-$items = @(Get-Disk -ErrorAction Stop | ForEach-Object {
-    $disk = $_
-    $number = [uint32]$disk.Number
-    $cimMatches = @($cimDisks | Where-Object { [uint32]$_.Index -eq $number })
-    $supportsRemovableMedia = $false
-    if ($cimMatches.Count -eq 1) {
-        $supportsRemovableMedia = @($cimMatches[0].Capabilities) -contains [uint16]7
-    }
-    [pscustomobject]@{
-        Number = $number
-        FriendlyName = [string]$disk.FriendlyName
-        Path = [string]$disk.Path
-        UniqueId = [string]$disk.UniqueId
-        SerialNumber = [string]$disk.SerialNumber
-        Size = [uint64]$disk.Size
-        LogicalSectorSize = [uint32]$disk.LogicalSectorSize
-        PhysicalSectorSize = [uint32]$disk.PhysicalSectorSize
-        IsBoot = [bool]$disk.IsBoot
-        IsSystem = [bool]$disk.IsSystem
-        IsOffline = [bool]$disk.IsOffline
-        IsReadOnly = [bool]$disk.IsReadOnly
-        BusType = [string]$disk.BusType
-        SupportsRemovableMedia = [bool]$supportsRemovableMedia
-    }
-})
-ConvertTo-Json -InputObject $items -Compress
-";
-
-    #[derive(Clone, Copy, Deserialize)]
-    #[serde(transparent)]
+    #[derive(Clone, Copy)]
     struct BoolFlag(bool);
 
     impl BoolFlag {
@@ -462,8 +489,6 @@ ConvertTo-Json -InputObject $items -Compress
         }
     }
 
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
     struct WindowsDisk {
         number: u32,
         friendly_name: String,
@@ -479,6 +504,27 @@ ConvertTo-Json -InputObject $items -Compress
         is_read_only: BoolFlag,
         bus_type: String,
         supports_removable_media: BoolFlag,
+    }
+
+    impl From<DiskRecord> for WindowsDisk {
+        fn from(disk: DiskRecord) -> Self {
+            Self {
+                number: disk.number,
+                friendly_name: disk.friendly_name,
+                path: disk.path,
+                unique_id: disk.unique_id,
+                serial_number: disk.serial_number,
+                size: disk.size,
+                logical_sector_size: disk.logical_sector_size,
+                physical_sector_size: disk.physical_sector_size,
+                is_boot: BoolFlag(disk.is_boot),
+                is_system: BoolFlag(disk.is_system),
+                is_offline: BoolFlag(disk.is_offline),
+                is_read_only: BoolFlag(disk.is_read_only),
+                bus_type: disk.bus_type,
+                supports_removable_media: BoolFlag(disk.supports_removable_media),
+            }
+        }
     }
 
     impl WindowsDisk {
@@ -541,39 +587,10 @@ ConvertTo-Json -InputObject $items -Compress
     }
 
     pub(super) fn removable_drives() -> Result<Vec<Drive>, DriveError> {
-        let mut command = crate::worker::windows_powershell_command()
-            .map_err(|error| DriveError::InvalidData(error.to_string()))?;
-        let output = command
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                QUERY_DISKS_SCRIPT,
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()?;
-        if output.stdout.len() > MAX_POWERSHELL_OUTPUT
-            || output.stderr.len() > MAX_POWERSHELL_OUTPUT
-        {
-            return Err(DriveError::InvalidData(
-                "Windows disk query output exceeded the safety limit".to_owned(),
-            ));
-        }
-        if !output.status.success() {
-            return Err(DriveError::InvalidData(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut disks: Vec<WindowsDisk> = serde_json::from_str(trimmed)
-            .map_err(|error| DriveError::InvalidData(error.to_string()))?;
+        let mut disks: Vec<WindowsDisk> = crate::windows_native::query_disks()?
+            .into_iter()
+            .map(WindowsDisk::from)
+            .collect();
         let mut drives = Vec::new();
         for disk in &mut disks {
             disk.normalize();
@@ -657,12 +674,24 @@ ConvertTo-Json -InputObject $items -Compress
         }
 
         #[test]
-        fn helper_uses_only_explicit_trusted_modules() {
-            assert!(QUERY_DISKS_SCRIPT.contains("SNAPDOG_STORAGE_MODULE"));
-            assert!(QUERY_DISKS_SCRIPT.contains("SNAPDOG_CIM_MODULE"));
-            assert!(QUERY_DISKS_SCRIPT.contains("$env:PSModulePath = ''"));
-            assert!(QUERY_DISKS_SCRIPT.contains("Capabilities) -contains [uint16]7"));
-            assert!(!QUERY_DISKS_SCRIPT.contains("Invoke-Expression"));
+        fn native_records_preserve_safety_fields() {
+            let record = DiskRecord {
+                number: 7,
+                friendly_name: "SnapDog test card".to_owned(),
+                path: "native-path".to_owned(),
+                unique_id: "MEDIA-1234".to_owned(),
+                serial_number: "SERIAL-5678".to_owned(),
+                size: 32_000_000_000,
+                logical_sector_size: 512,
+                physical_sector_size: 4_096,
+                is_boot: false,
+                is_system: false,
+                is_offline: false,
+                is_read_only: false,
+                bus_type: "SD".to_owned(),
+                supports_removable_media: false,
+            };
+            assert!(WindowsDisk::from(record).safe_removable());
         }
     }
 }

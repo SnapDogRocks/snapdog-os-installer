@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Privileged flash-worker boundary.
+//! Isolated flash-worker boundary.
 //!
-//! Production entry points require a platform-native elevation flow and a [`RawDeviceGate`]. The
+//! Production entry points require a platform-native authorization flow and a [`RawDeviceGate`]. The
 //! actual orchestration is backend-driven so all destructive behaviour can be exercised in tests
 //! with ordinary files, without ever opening a real device.
 
@@ -14,9 +14,6 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,23 +57,6 @@ pub const WINDOWS_RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const WORKER_JOB_ARGUMENT: &str = "--worker-job";
 const STAGING_BUFFER_SIZE: usize = 1024 * 1024;
-#[cfg(target_os = "windows")]
-const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
-#[cfg(target_os = "windows")]
-const WINDOWS_ADMIN_CHECK: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-$principal = [Security.Principal.WindowsPrincipal]::new(
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-)
-if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    exit 0
-}
-exit 1
-";
-
 /// Target identity captured while the user selected a drive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerDrive {
@@ -111,6 +91,9 @@ pub struct WorkerJob {
     pub cancel_path: Option<PathBuf>,
     #[serde(default)]
     pub skip_verification_path: Option<PathBuf>,
+    /// Private Unix socket used to pass an `authopen`-authorized target descriptor on macOS.
+    #[serde(default)]
+    pub macos_target_socket: Option<PathBuf>,
 }
 
 /// Worker state emitted as JSON lines.
@@ -208,15 +191,16 @@ pub enum WorkerError {
 
 /// Capability required before production code can open a raw device.
 ///
-/// It can only be obtained by an explicitly opted-in, root worker process. Tests never construct
-/// this value and use a file-backed platform implementation instead.
+/// On macOS it can only be obtained by the explicitly opted-in isolated worker; the worker still
+/// cannot open a raw device by path and must receive the exact `authopen` descriptor from the GUI.
+/// Linux and Windows retain their elevated-worker checks. Tests use a file-backed platform.
 #[derive(Debug)]
 pub struct RawDeviceGate {
     _private: (),
 }
 
 impl RawDeviceGate {
-    /// Validate the explicit environment opt-in and effective worker identity.
+    /// Validate the explicit opt-in for the isolated macOS worker.
     #[cfg(target_os = "macos")]
     pub fn from_environment() -> Result<Self, WorkerError> {
         if std::env::var_os(RAW_DEVICE_OPT_IN).as_deref()
@@ -225,7 +209,7 @@ impl RawDeviceGate {
             return Err(WorkerError::RawDeviceDisabled);
         }
 
-        Self::from_root_worker()
+        Ok(Self { _private: () })
     }
 
     /// Validate the root identity supplied by `PolicyKit`.
@@ -238,7 +222,7 @@ impl RawDeviceGate {
         Self::from_root_worker()
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn from_root_worker() -> Result<Self, WorkerError> {
         let output = ["/usr/bin/id", "/bin/id"]
             .into_iter()
@@ -258,20 +242,9 @@ impl RawDeviceGate {
         if !windows_worker_arguments_are_authorized() {
             return Err(WorkerError::RawDeviceDisabled);
         }
-        let status = windows_powershell_command()?
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                WINDOWS_ADMIN_CHECK,
-            ])
-            .creation_flags(WINDOWS_CREATE_NO_WINDOW)
-            .status()
-            .map_err(|error| WorkerError::Platform(error.to_string()))?;
-        if !status.success() {
+        if !crate::windows_native::is_elevated()
+            .map_err(|error| WorkerError::Platform(error.to_string()))?
+        {
             return Err(WorkerError::NotRoot);
         }
         Ok(Self { _private: () })
@@ -329,7 +302,12 @@ impl<W: Write> ProgressSink for JsonLineProgress<W> {
 /// elevated worker process. No raw path supplied by the job is opened directly.
 #[cfg(target_os = "macos")]
 pub fn run_macos_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashReport, WorkerError> {
-    run_unix_worker(job, &mut macos::MacOsPlatform)
+    let socket = job.macos_target_socket.clone().ok_or_else(|| {
+        WorkerError::InvalidJob(
+            "macOS raw-device writing requires an authorized target socket".to_owned(),
+        )
+    })?;
+    run_unix_worker(job, &mut macos::MacOsPlatform::new(socket))
 }
 
 /// Run one raw-device job on Linux after native privilege elevation.
@@ -451,7 +429,32 @@ impl PrivilegedSession {
         session.validate_existing_file(progress_path, "worker-progress.jsonl", Some(0), true)?;
         session.validate_marker(job.cancel_path.as_deref(), "cancel")?;
         session.validate_marker(job.skip_verification_path.as_deref(), "skip-verification")?;
+        #[cfg(target_os = "macos")]
+        if let Some(path) = job.macos_target_socket.as_deref() {
+            session.validate_socket(path, "authorized-target.sock")?;
+        }
         Ok(session)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn validate_socket(&self, path: &Path, expected_name: &str) -> Result<(), WorkerError> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        self.validate_member_path(path, expected_name)?;
+        self.ensure_directory_unchanged()?;
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            invalid_session(format!("authorized target socket is unavailable: {error}"))
+        })?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != self.owner_uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(invalid_session(
+                "authorized target socket has unsafe ownership, permissions, links, or type",
+            ));
+        }
+        self.ensure_directory_unchanged()
     }
 
     fn validate_existing_file(
@@ -758,123 +761,17 @@ fn windows_local_disk(path: &Path) -> Option<u8> {
 
 #[cfg(target_os = "windows")]
 fn validate_windows_local_fixed_disk(path: &Path) -> Result<(), WorkerError> {
-    const SESSION_ROOT_ENV: &str = "SNAPDOG_SESSION_ROOT";
-    const CHECK_LOCAL_FIXED_DISK: &str = r"
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$PSModuleAutoloadingPreference = 'None'
-$env:PSModulePath = ''
-$root = [string]$env:SNAPDOG_SESSION_ROOT
-if ($root.Length -ne 3 -or $root[1] -ne ':' -or $root[2] -ne '\') { exit 1 }
-$drive = [System.IO.DriveInfo]::new($root)
-if ($drive.IsReady -and $drive.DriveType -eq [System.IO.DriveType]::Fixed) { exit 0 }
-exit 1
-";
-    let letter = windows_local_disk(path)
-        .ok_or_else(|| invalid_session("session paths must use a local drive-letter root"))?;
-    let root = format!("{}:\\", char::from(letter));
-    let status = windows_powershell_command()?
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            CHECK_LOCAL_FIXED_DISK,
-        ])
-        .env(SESSION_ROOT_ENV, root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(WINDOWS_CREATE_NO_WINDOW)
-        .status()
-        .map_err(|error| invalid_session(format!("could not inspect session drive: {error}")))?;
-    if !status.success() {
+    if windows_local_disk(path).is_none() {
+        return Err(invalid_session(
+            "session paths must use a local drive-letter root",
+        ));
+    }
+    if !crate::windows_native::is_fixed_drive_path(path) {
         return Err(invalid_session(
             "worker session must be stored on a ready local fixed disk",
         ));
     }
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn windows_powershell_command() -> Result<std::process::Command, WorkerError> {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    const STORAGE_MODULE_ENV: &str = "SNAPDOG_STORAGE_MODULE";
-    const CIM_MODULE_ENV: &str = "SNAPDOG_CIM_MODULE";
-
-    // Resolve the system directory through the Windows Known Folders API. Environment variables
-    // such as SystemRoot, WINDIR, PATH, and PSModulePath are process-controlled input and must not
-    // select executables or modules for a privileged raw-disk helper.
-    let system_directory = known_folders::get_known_folder_path(known_folders::KnownFolder::System)
-        .ok_or_else(|| {
-            WorkerError::Platform("Windows system directory is unavailable".to_owned())
-        })?;
-    if windows_local_disk(&system_directory).is_none()
-        || system_directory
-            .file_name()
-            .is_none_or(|name| !name.to_string_lossy().eq_ignore_ascii_case("System32"))
-    {
-        return Err(WorkerError::Platform(
-            "Windows system directory is not a canonical local System32 path".to_owned(),
-        ));
-    }
-    let system_root = system_directory.parent().ok_or_else(|| {
-        WorkerError::Platform("Windows system directory has no parent".to_owned())
-    })?;
-    let system_temp = system_root.join("Temp");
-    let windows_powershell = system_directory.join("WindowsPowerShell");
-    let powershell_root = windows_powershell.join("v1.0");
-    let modules = powershell_root.join("Modules");
-    let storage_module_directory = modules.join("Storage");
-    let cim_module_directory = modules.join("CimCmdlets");
-    let powershell = powershell_root.join("powershell.exe");
-    let storage_module = storage_module_directory.join("Storage.psd1");
-    let cim_module = cim_module_directory.join("CimCmdlets.psd1");
-
-    for directory in [
-        system_root,
-        system_temp.as_path(),
-        system_directory.as_path(),
-        windows_powershell.as_path(),
-        powershell_root.as_path(),
-        modules.as_path(),
-        storage_module_directory.as_path(),
-        cim_module_directory.as_path(),
-    ] {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|error| WorkerError::Platform(error.to_string()))?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(WorkerError::Platform(
-                "Windows PowerShell has an unsafe directory identity".to_owned(),
-            ));
-        }
-    }
-    for file in [&powershell, &storage_module, &cim_module] {
-        let metadata =
-            fs::symlink_metadata(file).map_err(|error| WorkerError::Platform(error.to_string()))?;
-        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(WorkerError::Platform(
-                "Windows PowerShell has an unsafe executable or module identity".to_owned(),
-            ));
-        }
-    }
-
-    let mut command = std::process::Command::new(powershell);
-    command
-        .env_clear()
-        .env("SystemRoot", system_root)
-        .env("WINDIR", system_root)
-        .env("TEMP", &system_temp)
-        .env("TMP", &system_temp)
-        .env("PATH", &system_directory)
-        .env("PSModulePath", "")
-        .env(STORAGE_MODULE_ENV, storage_module)
-        .env(CIM_MODULE_ENV, cim_module);
-    Ok(command)
 }
 
 #[cfg(target_os = "windows")]
@@ -1266,6 +1163,10 @@ fn validate_job(job: &WorkerJob) -> Result<(), WorkerError> {
             &job.progress,
             ProgressDestination::File { path } if !path.is_absolute()
         )
+        || job
+            .macos_target_socket
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
     {
         return Err(WorkerError::InvalidJob(
             "worker file paths must be absolute".to_owned(),
@@ -1744,6 +1645,7 @@ mod tests {
             progress: ProgressDestination::Stdout,
             cancel_path: None,
             skip_verification_path: None,
+            macos_target_socket: None,
         };
         let platform = FilePlatform {
             current: drive,
@@ -2072,6 +1974,7 @@ mod tests {
             },
             cancel_path: Some(directory.path().join("cancel")),
             skip_verification_path: Some(directory.path().join("skip-verification")),
+            macos_target_socket: None,
         };
         (directory, job, job_path)
     }
