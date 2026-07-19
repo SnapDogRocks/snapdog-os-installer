@@ -2,7 +2,7 @@
 
 //! Unprivileged image preparation and privileged worker orchestration.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,7 +316,7 @@ where
     .map_err(map_preparation_error)?;
     ensure_not_cancelled(control)?;
     ensure_target_capacity(&prepared, &request.drive)?;
-    File::open(&raw_path)?.sync_all()?;
+    OpenOptions::new().write(true).open(&raw_path)?.sync_all()?;
 
     create_empty_file(&progress_path)?;
     let worker_job = WorkerJob {
