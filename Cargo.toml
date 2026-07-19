@@ -1,0 +1,63 @@
+[package]
+name = "snapdog-os-installer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+repository = "https://github.com/SnapDogRocks/snapdog-os-installer"
+homepage = "https://snapdog.cc"
+authors = ["Fabian Schmieder"]
+description = "Guided cross-platform SD card writer for SnapDog OS"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
+egui_extras = { version = "=0.33.3", default-features = false, features = ["image", "svg"] }
+flate2 = "1"
+hex = "0.4"
+image = { version = "=0.25.9", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+wgpu = { version = "=27.0.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=27.0.1", default-features = false, features = ["gles", "vulkan"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# wayland-scanner 0.31.10 still pins quick-xml 0.39, which is affected by
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Pin the upstream fix until 0.31.11 ships.
+[patch.crates-io]
+wayland-scanner = { git = "https://github.com/Smithay/wayland-rs.git", rev = "a55c54b4e138e29181d63908ece06fd2a13550a0" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
