@@ -44,6 +44,17 @@ try {
         throw "Packaged executable is empty: $TemporaryOutput"
     }
 
+    # Verify the final PE resource rather than trusting only its versioned filename. Release
+    # Please updates Cargo.toml, and build.rs must embed that exact SemVer for Explorer's Details
+    # tab while winresource maps its numeric components to the fixed VERSIONINFO fields.
+    $VersionInfo = $File.VersionInfo
+    if ($VersionInfo.FileVersion -ne $Package.version -or $VersionInfo.ProductVersion -ne $Package.version) {
+        throw "Embedded Windows version does not match Cargo package version $($Package.version): FileVersion=$($VersionInfo.FileVersion), ProductVersion=$($VersionInfo.ProductVersion)"
+    }
+    if ($VersionInfo.ProductName -ne 'SnapDog OS Installer' -or $VersionInfo.OriginalFilename -ne 'snapdog-os-installer.exe') {
+        throw 'Packaged executable has incomplete Windows product metadata.'
+    }
+
     $Dumpbin = @(Get-Command 'dumpbin.exe' -CommandType Application -ErrorAction Stop)[0]
     $DependenciesOutput = & $Dumpbin.Source /nologo /dependents $File.FullName 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
