@@ -1080,6 +1080,7 @@ impl SnapDogInstallerApp {
                 .corner_radius(12.0)
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
+                    let mut switch_rect = egui::Rect::NOTHING;
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(RichText::new("Verify after writing").strong());
@@ -1090,9 +1091,26 @@ impl SnapDogInstallerApp {
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.toggle_value(&mut self.verify_after_write, "");
+                            (switch_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(44.0, 26.0), egui::Sense::hover());
                         });
                     });
+                    let mut response = ui.interact(
+                        ui.min_rect(),
+                        ui.id().with("verify-after-writing"),
+                        egui::Sense::click(),
+                    );
+                    let keyboard_activation = response.has_focus()
+                        && ui.input(|input| {
+                            input.key_pressed(egui::Key::Space)
+                                || input.key_pressed(egui::Key::Enter)
+                        });
+                    if response.clicked() || keyboard_activation {
+                        self.verify_after_write = !self.verify_after_write;
+                        response.mark_changed();
+                    }
+                    paint_apple_switch(ui, switch_rect, &response, self.verify_after_write);
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
                 });
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
@@ -1104,11 +1122,7 @@ impl SnapDogInstallerApp {
                     show_notices = true;
                 }
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new("(C) 2026 Fabian Schmieder")
-                        .color(MUTED)
-                        .small(),
-                );
+                ui.label(RichText::new("(C) 2026 Fabian Schmieder").color(MUTED));
                 ui.hyperlink_to("Licensed under GPL-3", GPL_3_URL);
             });
             ui.add_space(14.0);
@@ -1327,6 +1341,50 @@ impl SnapDogInstallerApp {
     }
 }
 
+fn paint_apple_switch(ui: &egui::Ui, rect: egui::Rect, response: &egui::Response, selected: bool) {
+    let track = egui::Rect::from_center_size(rect.center(), Vec2::new(42.0, 24.0));
+    let position = ui.ctx().animate_bool(response.id, selected);
+    let track_color = if selected {
+        ORANGE
+    } else if response.hovered() {
+        Color32::from_rgb(104, 100, 97)
+    } else {
+        Color32::from_rgb(84, 80, 77)
+    };
+    ui.painter().rect_filled(track, 12.0, track_color);
+    ui.painter().rect_stroke(
+        track,
+        12.0,
+        Stroke::new(
+            1.0,
+            if selected {
+                Color32::from_rgb(242, 154, 65)
+            } else {
+                Color32::from_rgb(130, 126, 122)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    let thumb_x = egui::lerp((track.left() + 12.0)..=(track.right() - 12.0), position);
+    let thumb_center = egui::pos2(thumb_x, track.center().y);
+    ui.painter().circle_filled(
+        thumb_center + Vec2::new(0.0, 0.8),
+        9.3,
+        Color32::from_black_alpha(70),
+    );
+    ui.painter().circle_filled(thumb_center, 9.3, TEXT);
+
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            track.expand(3.0),
+            15.0,
+            Stroke::new(2.0, BRIGHT_ORANGE),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ToolbarIcon {
     Settings,
@@ -1382,14 +1440,20 @@ fn paint_toolbar_icon(
     match icon {
         ToolbarIcon::Settings => {
             let center = rect.center();
-            let mut points = Vec::with_capacity(32);
-            for index in 0_u16..32 {
-                let angle = f32::from(index) * std::f32::consts::TAU / 32.0;
-                let radius = if index % 4 < 2 { 13.0 } else { 9.7 };
-                points.push(center + Vec2::new(angle.cos(), angle.sin()) * radius);
+            ui.painter().circle_filled(center, 10.2, color);
+            for index in 0_u16..8 {
+                let angle = f32::from(index) * std::f32::consts::TAU / 8.0;
+                let tangent = Vec2::new(-angle.sin(), angle.cos());
+                let radial = Vec2::new(angle.cos(), angle.sin());
+                let tooth = vec![
+                    center + radial * 8.6 + tangent * 2.6,
+                    center + radial * 13.0 + tangent * 2.1,
+                    center + radial * 13.0 - tangent * 2.1,
+                    center + radial * 8.6 - tangent * 2.6,
+                ];
+                ui.painter()
+                    .add(egui::Shape::convex_polygon(tooth, color, Stroke::NONE));
             }
-            ui.painter()
-                .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
             let cutout = if response.hovered() && enabled {
                 ELEVATED
             } else {
