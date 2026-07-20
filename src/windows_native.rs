@@ -28,7 +28,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     FindVolumeClose, GetDriveTypeW, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
-use windows_sys::Win32::System::Ioctl::{DISK_EXTENT, FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
+use windows_sys::Win32::System::Ioctl::{
+    DISK_EXTENT, FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, GET_LENGTH_INFORMATION,
+    IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX, IOCTL_STORAGE_QUERY_PROPERTY,
+    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_DESCRIPTOR,
+    STORAGE_DEVICE_NUMBER_EX, STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty,
+    StorageDeviceProperty,
+};
 use windows_sys::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
 };
@@ -65,6 +71,21 @@ pub struct DiskRecord {
     pub is_read_only: bool,
     pub bus_type: String,
     pub supports_removable_media: bool,
+}
+
+/// Kernel identity read directly from an already-open whole-disk handle.
+///
+/// Unlike `MSFT_Disk`, these values remain available while every filesystem volume on the disk is
+/// locked and dismounted. The device GUID binds the pre-dismount pin to the exclusive writer that
+/// replaces it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenDiskIdentity {
+    pub number: u32,
+    pub device_guid: [u8; 16],
+    pub size: u64,
+    pub logical_sector_size: u32,
+    pub physical_sector_size: u32,
+    pub bus_type: String,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +195,70 @@ pub fn query_disk(number: u32) -> io::Result<DiskRecord> {
     }
 }
 
+/// Read stable disk identity from a live physical-drive handle without consulting WMI.
+pub fn query_open_disk(file: &File) -> io::Result<OpenDiskIdentity> {
+    let device: STORAGE_DEVICE_NUMBER_EX = device_io_struct_output(
+        file,
+        IOCTL_STORAGE_GET_DEVICE_NUMBER_EX,
+        "device-number identity",
+    )?;
+    if usize::try_from(device.Size).ok() != Some(size_of::<STORAGE_DEVICE_NUMBER_EX>()) {
+        return Err(io::Error::other(
+            "Windows returned an invalid device-number identity size",
+        ));
+    }
+
+    let length: GET_LENGTH_INFORMATION =
+        device_io_struct_output(file, IOCTL_DISK_GET_LENGTH_INFO, "disk length")?;
+    let size = u64::try_from(length.Length)
+        .map_err(|_| io::Error::other("Windows returned a negative disk length"))?;
+
+    let alignment: STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR =
+        query_storage_property(file, StorageAccessAlignmentProperty, "storage alignment")?;
+    if usize::try_from(alignment.Size).ok()
+        != Some(size_of::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>())
+    {
+        return Err(io::Error::other(
+            "Windows returned an invalid storage-alignment size",
+        ));
+    }
+
+    let descriptor: STORAGE_DEVICE_DESCRIPTOR =
+        query_storage_property(file, StorageDeviceProperty, "device descriptor")?;
+    if usize::try_from(descriptor.Size).ok() < Some(size_of::<STORAGE_DEVICE_DESCRIPTOR>()) {
+        return Err(io::Error::other(
+            "Windows returned an invalid device-descriptor size",
+        ));
+    }
+
+    Ok(OpenDiskIdentity {
+        number: device.DeviceNumber,
+        device_guid: guid_bytes(device.DeviceGuid),
+        size,
+        logical_sector_size: alignment.BytesPerLogicalSector,
+        physical_sector_size: alignment.BytesPerPhysicalSector,
+        bus_type: storage_bus_name(descriptor.BusType).to_owned(),
+    })
+}
+
+fn guid_bytes(guid: windows_sys::core::GUID) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&guid.data1.to_le_bytes());
+    bytes[4..6].copy_from_slice(&guid.data2.to_le_bytes());
+    bytes[6..8].copy_from_slice(&guid.data3.to_le_bytes());
+    bytes[8..].copy_from_slice(&guid.data4);
+    bytes
+}
+
+const fn storage_bus_name(value: i32) -> &'static str {
+    match value {
+        windows_sys::Win32::Storage::FileSystem::BusTypeUsb => "USB",
+        windows_sys::Win32::Storage::FileSystem::BusTypeSd => "SD",
+        windows_sys::Win32::Storage::FileSystem::BusTypeMmc => "MMC",
+        _ => "OTHER",
+    }
+}
+
 fn wmi_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("native Windows storage query failed: {error}"))
 }
@@ -248,7 +333,24 @@ pub fn lock_and_dismount_volumes(disk_number: u32) -> io::Result<LockedVolumes> 
     let mut handles = Vec::new();
     for volume in volume_names()? {
         let query = open_volume(&volume, 0)?;
-        match volume_relation(&query, disk_number)? {
+        let relation = match volume_relation(&query, disk_number) {
+            Ok(relation) => relation,
+            Err(error) if unsupported_volume_extents(&error) => {
+                tracing::debug!(
+                    volume,
+                    %error,
+                    "ignoring a Windows volume without physical-disk extents"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("could not inspect physical extents for {volume}: {error}"),
+                ));
+            }
+        };
+        match relation {
             VolumeRelation::Unrelated => continue,
             VolumeRelation::Spanned => {
                 return Err(io::Error::other(
@@ -268,15 +370,26 @@ pub fn lock_and_dismount_volumes(disk_number: u32) -> io::Result<LockedVolumes> 
                 ),
             )
         })?;
+        tracing::debug!(volume, disk_number, "locked Windows target volume");
         device_io_no_buffer(&handle, FSCTL_DISMOUNT_VOLUME).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("could not dismount {volume}: {error}"),
             )
         })?;
+        tracing::debug!(volume, disk_number, "dismounted Windows target volume");
         handles.push(handle);
     }
     Ok(LockedVolumes { _handles: handles })
+}
+
+fn unsupported_volume_extents(error: &io::Error) -> bool {
+    // Volume enumeration also returns non-disk providers (for example optical, network, and
+    // virtual filesystem volumes). Those providers legitimately reject the disk-extents IOCTL.
+    // They cannot belong to the selected physical disk and are therefore unrelated by
+    // construction. All other failures remain fatal so access and parsing errors cannot weaken
+    // target validation.
+    matches!(error.raw_os_error(), Some(1 | 50))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +535,89 @@ fn device_io_no_buffer(file: &File, code: u32) -> io::Result<()> {
     }
 }
 
+fn device_io_struct_output<T: Copy + Default>(
+    file: &File,
+    code: u32,
+    description: &str,
+) -> io::Result<T> {
+    let mut output = T::default();
+    let output_len = u32::try_from(size_of::<T>())
+        .map_err(|_| io::Error::other("Windows I/O structure is too large"))?;
+    let mut returned = 0;
+    // SAFETY: `output` is writable for exactly `output_len` bytes and the synchronous call keeps
+    // both it and the live file handle borrowed until completion.
+    let ok = unsafe {
+        DeviceIoControl(
+            std::os::windows::io::AsRawHandle::as_raw_handle(file) as HANDLE,
+            code,
+            null(),
+            0,
+            (&raw mut output).cast::<c_void>(),
+            output_len,
+            &raw mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("could not query {description}: {error}"),
+        ));
+    }
+    if returned < output_len {
+        return Err(io::Error::other(format!(
+            "Windows returned truncated {description} data"
+        )));
+    }
+    Ok(output)
+}
+
+fn query_storage_property<T: Copy + Default>(
+    file: &File,
+    property_id: i32,
+    description: &str,
+) -> io::Result<T> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: property_id,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut output = T::default();
+    let input_len = u32::try_from(size_of::<STORAGE_PROPERTY_QUERY>())
+        .map_err(|_| io::Error::other("Windows property query is too large"))?;
+    let output_len = u32::try_from(size_of::<T>())
+        .map_err(|_| io::Error::other("Windows property result is too large"))?;
+    let mut returned = 0;
+    // SAFETY: `query` is readable and `output` is writable for the exact byte counts supplied;
+    // both values and the file handle remain alive throughout the synchronous call.
+    let ok = unsafe {
+        DeviceIoControl(
+            std::os::windows::io::AsRawHandle::as_raw_handle(file) as HANDLE,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast::<c_void>(),
+            input_len,
+            (&raw mut output).cast::<c_void>(),
+            output_len,
+            &raw mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("could not query {description}: {error}"),
+        ));
+    }
+    if returned < output_len {
+        return Err(io::Error::other(format!(
+            "Windows returned truncated {description} data"
+        )));
+    }
+    Ok(output)
+}
+
 fn device_io_output(file: &File, code: u32, output: &mut [u8]) -> io::Result<usize> {
     let output_len = u32::try_from(output.len())
         .map_err(|_| io::Error::other("Windows I/O buffer is too large"))?;
@@ -558,5 +754,17 @@ mod tests {
         assert_eq!(utf16_buffer(&[u16::from(b'A'), 0, 9]).unwrap(), "A");
         assert!(utf16_buffer(&[u16::from(b'A')]).is_err());
         assert!(utf16_buffer(&[0xD800, 0]).is_err());
+    }
+
+    #[test]
+    fn skips_only_volume_providers_without_disk_extents() {
+        assert!(unsupported_volume_extents(&io::Error::from_raw_os_error(1)));
+        assert!(unsupported_volume_extents(&io::Error::from_raw_os_error(
+            50
+        )));
+        assert!(!unsupported_volume_extents(&io::Error::from_raw_os_error(
+            5
+        )));
+        assert!(!unsupported_volume_extents(&io::Error::other("broken")));
     }
 }

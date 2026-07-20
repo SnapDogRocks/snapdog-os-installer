@@ -157,10 +157,14 @@ impl WindowsTarget {
         capacity: u64,
         logical_sector_size: u32,
         physical_sector_size: u32,
+        expected_identity: &crate::windows_native::OpenDiskIdentity,
     ) -> io::Result<()> {
         self.sync_all()?;
         drop(self.writer.take());
         let file = open_unbuffered_target(device)?;
+        let reopened_identity = crate::windows_native::query_open_disk(&file)?;
+        validate_open_identity(expected_identity, &reopened_identity)
+            .map_err(|error| io::Error::other(error.to_string()))?;
         self.verifier = Some(UnbufferedVerifier::new(
             file,
             capacity,
@@ -168,6 +172,22 @@ impl WindowsTarget {
             physical_sector_size,
         )?);
         Ok(())
+    }
+
+    fn open_identity(&self) -> io::Result<crate::windows_native::OpenDiskIdentity> {
+        match (&self.writer, &self.verifier) {
+            (Some(writer), _) => crate::windows_native::query_open_disk(writer),
+            (None, Some(verifier)) => crate::windows_native::query_open_disk(&verifier.file),
+            (None, None) => Err(io::Error::other("Windows target handle is unavailable")),
+        }
+    }
+
+    fn try_clone_active_handle(&self) -> io::Result<File> {
+        match (&self.writer, &self.verifier) {
+            (Some(writer), _) => writer.try_clone(),
+            (None, Some(verifier)) => verifier.file.try_clone(),
+            (None, None) => Err(io::Error::other("Windows target handle is unavailable")),
+        }
     }
 }
 
@@ -340,36 +360,9 @@ pub struct WindowsPlatform {
     write_may_have_started: bool,
     prepared_target: Option<File>,
     post_write_pin: Option<File>,
-    post_write_identity: Option<PostWriteIdentity>,
+    open_identity: Option<crate::windows_native::OpenDiskIdentity>,
     rollback_snapshot: Option<DiskSnapshot>,
     locked_volumes: Option<crate::windows_native::LockedVolumes>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PostWriteIdentity {
-    number: u32,
-    path: String,
-    serial_number: String,
-    size: u64,
-    logical_sector_size: u32,
-    physical_sector_size: u32,
-    bus_type: String,
-    supports_removable_media: BoolFlag,
-}
-
-impl From<&DiskSnapshot> for PostWriteIdentity {
-    fn from(snapshot: &DiskSnapshot) -> Self {
-        Self {
-            number: snapshot.number,
-            path: snapshot.path.clone(),
-            serial_number: snapshot.serial_number.clone(),
-            size: snapshot.size,
-            logical_sector_size: snapshot.logical_sector_size,
-            physical_sector_size: snapshot.physical_sector_size,
-            bus_type: snapshot.bus_type.clone(),
-            supports_removable_media: snapshot.supports_removable_media,
-        }
-    }
 }
 
 impl WindowsPlatform {
@@ -379,6 +372,7 @@ impl WindowsPlatform {
         }
         drop(self.prepared_target.take());
         drop(self.post_write_pin.take());
+        drop(self.locked_volumes.take());
         let expected = self
             .rollback_snapshot
             .as_ref()
@@ -389,9 +383,8 @@ impl WindowsPlatform {
         if current != *expected {
             return Err(WorkerError::TargetChanged);
         }
-        drop(self.locked_volumes.take());
         self.rollback_snapshot = None;
-        self.post_write_identity = None;
+        self.open_identity = None;
         self.volumes_dismounted = false;
         Ok(())
     }
@@ -402,8 +395,17 @@ impl WorkerPlatform for WindowsPlatform {
 
     fn validate_target(&mut self, selected: &WorkerDrive) -> Result<WorkerDrive, WorkerError> {
         let identity = SelectedDisk::parse(selected)?;
+        tracing::info!(
+            disk_number = identity.number,
+            device = identity.device,
+            "validating Windows target"
+        );
         let snapshot = query_disk(identity.number)?;
         validate_snapshot(selected, &identity, &snapshot, Some(false))?;
+        tracing::info!(
+            disk_number = identity.number,
+            "Windows target validation succeeded"
+        );
         Ok(selected.clone())
     }
 
@@ -416,6 +418,11 @@ impl WorkerPlatform for WindowsPlatform {
             return Err(WorkerError::UnsafeTarget);
         }
         let identity = SelectedDisk::parse(selected)?;
+        tracing::info!(
+            disk_number = identity.number,
+            device = identity.device,
+            "locking Windows target volumes"
+        );
         let snapshot = query_disk(identity.number)?;
         validate_snapshot(selected, &identity, &snapshot, Some(false))?;
 
@@ -425,33 +432,47 @@ impl WorkerPlatform for WindowsPlatform {
         let device_pin = open_device_pin(&identity.device)?;
         let pinned_snapshot = query_disk(identity.number)?;
         validate_snapshot(selected, &identity, &pinned_snapshot, Some(false))?;
-        self.post_write_identity = Some(PostWriteIdentity::from(&pinned_snapshot));
+        let pinned_identity = query_open_identity(&device_pin)?;
+        validate_open_identity_against_snapshot(&pinned_snapshot, &pinned_identity)?;
+        tracing::info!(
+            disk_number = pinned_identity.number,
+            size = pinned_identity.size,
+            logical_sector_size = pinned_identity.logical_sector_size,
+            physical_sector_size = pinned_identity.physical_sector_size,
+            bus_type = pinned_identity.bus_type,
+            "pinned native Windows disk identity"
+        );
         self.rollback_snapshot = Some(pinned_snapshot);
         let locked_volumes = match crate::windows_native::lock_and_dismount_volumes(identity.number)
         {
             Ok(handles) => handles,
             Err(error) => {
-                self.post_write_identity = None;
+                self.open_identity = None;
                 self.rollback_snapshot = None;
                 return Err(WorkerError::Platform(error.to_string()));
             }
         };
         self.locked_volumes = Some(locked_volumes);
         self.volumes_dismounted = true;
+        tracing::info!(
+            disk_number = identity.number,
+            "Windows target volumes locked and dismounted"
+        );
         drop(device_pin);
 
         let prepared = (|| {
-            let dismounted_snapshot = query_disk(identity.number)?;
-            validate_snapshot(selected, &identity, &dismounted_snapshot, Some(false))?;
-
             // Acquiring this zero-share handle is the decisive proof that no mounted filesystem or
             // competing process still owns the target. It is retained across the final identity
             // check and handed directly to the writer, so the path is never reopened for writing.
             let target = open_exclusive_target(&identity.device)?;
-            let exclusive_snapshot = query_disk(identity.number)?;
-            validate_snapshot(selected, &identity, &exclusive_snapshot, Some(false))?;
+            let exclusive_identity = query_open_identity(&target)?;
+            validate_open_identity(&pinned_identity, &exclusive_identity)?;
             self.prepared_target = Some(target);
-            self.post_write_identity = Some(PostWriteIdentity::from(&exclusive_snapshot));
+            self.open_identity = Some(exclusive_identity);
+            tracing::info!(
+                disk_number = identity.number,
+                "exclusive Windows target handle prepared"
+            );
             Ok(())
         })();
         if let Err(error) = prepared {
@@ -473,13 +494,21 @@ impl WorkerPlatform for WindowsPlatform {
         if !self.volumes_dismounted {
             return Err(WorkerError::UnsafeTarget);
         }
-        let identity = SelectedDisk::parse(selected)?;
-        let snapshot = query_disk(identity.number)?;
-        validate_snapshot(selected, &identity, &snapshot, Some(false))?;
+        let _identity = SelectedDisk::parse(selected)?;
         let target = self
             .prepared_target
             .take()
             .ok_or(WorkerError::UnsafeTarget)?;
+        let current = query_open_identity(&target)?;
+        let expected = self
+            .open_identity
+            .as_ref()
+            .ok_or(WorkerError::UnsafeTarget)?;
+        validate_open_identity(expected, &current)?;
+        tracing::info!(
+            disk_number = current.number,
+            "handing native Windows target handle to writer"
+        );
         self.post_write_pin = Some(
             target
                 .try_clone()
@@ -496,14 +525,17 @@ impl WorkerPlatform for WindowsPlatform {
         target: &mut Self::Target,
     ) -> Result<(), crate::flash::FlashError> {
         let identity = SelectedDisk::parse(selected).map_err(|error| worker_as_io(&error))?;
-        let before = query_disk(identity.number).map_err(|error| worker_as_io(&error))?;
         let expected = self
-            .post_write_identity
+            .open_identity
             .as_ref()
             .ok_or(WorkerError::UnsafeTarget)
             .map_err(|error| worker_as_io(&error))?;
-        validate_post_write_snapshot(selected, &identity, &before, expected)
+        validate_open_identity(expected, &target.open_identity()?)
             .map_err(|error| worker_as_io(&error))?;
+        tracing::info!(
+            disk_number = expected.number,
+            "reopening Windows target for unbuffered verification"
+        );
 
         // Both clones refer to the zero-share write-through handle. Flush first, then close every
         // clone so Windows will grant a new zero-share, NO_BUFFERING read handle.
@@ -511,16 +543,15 @@ impl WorkerPlatform for WindowsPlatform {
         drop(self.post_write_pin.take());
         target.begin_verification(
             &identity.device,
-            before.size,
-            before.logical_sector_size,
-            before.physical_sector_size,
+            expected.size,
+            expected.logical_sector_size,
+            expected.physical_sector_size,
+            expected,
         )?;
-
-        // Revalidate while the new exclusive handle pins the object. If the device number was
-        // recycled during the close/reopen window, verification stops before hashing any bytes.
-        let pinned = query_disk(identity.number).map_err(|error| worker_as_io(&error))?;
-        validate_post_write_snapshot(selected, &identity, &pinned, expected)
-            .map_err(|error| worker_as_io(&error))?;
+        // `begin_verification` must close every buffered writer clone before Windows will grant
+        // the cache-bypassing zero-share reader. Pin that newly opened verifier instead, so the
+        // physical device object cannot be replaced between verification and final cleanup.
+        self.post_write_pin = Some(target.try_clone_active_handle()?);
         Ok(())
     }
 
@@ -538,29 +569,34 @@ impl WorkerPlatform for WindowsPlatform {
         // `open_target` duplicates the same exclusive kernel handle before handing it to the
         // writer. Retain that pin across the first post-write identity query so the device number
         // cannot be recycled between the write and cleanup.
-        let snapshot = query_disk(identity.number)?;
-        let post_write_identity = self
-            .post_write_identity
+        let expected = self
+            .open_identity
             .as_ref()
             .ok_or(WorkerError::UnsafeTarget)?;
-        validate_post_write_snapshot(selected, &identity, &snapshot, post_write_identity)?;
+        let pin = self
+            .post_write_pin
+            .as_ref()
+            .ok_or(WorkerError::UnsafeTarget)?;
+        validate_open_identity(expected, &query_open_identity(pin)?)?;
         drop(self.post_write_pin.take());
 
         if self.locked_volumes.is_none() {
             return Err(WorkerError::UnsafeTarget);
         }
-        let pinned = query_disk(identity.number)?;
-        validate_post_write_snapshot(selected, &identity, &pinned, post_write_identity)?;
-
         // Reacquiring an exclusive handle proves that the freshly written partition table did not
         // race an automatic mount. Closing that handle after WRITE_THROUGH flushing leaves the
         // removable medium in the safe-removal state even on controllers without inbox eject.
         let proof = open_exclusive_target(&identity.device)?;
+        validate_open_identity(expected, &query_open_identity(&proof)?)?;
         proof
             .sync_all()
             .map_err(|error| WorkerError::Platform(error.to_string()))?;
         drop(proof);
         drop(self.locked_volumes.take());
+        tracing::info!(
+            disk_number = expected.number,
+            "Windows target cleanup completed"
+        );
         self.volumes_dismounted = true;
         self.write_may_have_started = true;
         Ok(())
@@ -648,27 +684,34 @@ fn validate_snapshot(
     compare_drive(selected, &current)
 }
 
-fn validate_post_write_snapshot(
-    selected: &WorkerDrive,
-    identity: &SelectedDisk,
+fn query_open_identity(
+    file: &File,
+) -> Result<crate::windows_native::OpenDiskIdentity, WorkerError> {
+    crate::windows_native::query_open_disk(file)
+        .map_err(|error| WorkerError::Platform(error.to_string()))
+}
+
+fn validate_open_identity_against_snapshot(
     snapshot: &DiskSnapshot,
-    expected: &PostWriteIdentity,
+    current: &crate::windows_native::OpenDiskIdentity,
 ) -> Result<(), WorkerError> {
-    // A raw image may replace the disk signature/GPT GUID represented by the storage provider's
-    // `UniqueId`, so
-    // the pre-write fingerprint is intentionally not required after the exclusive handle closes.
-    // The hardware-facing path and serial remain stable, however, and prevent a same-size medium
-    // swapped onto the same PhysicalDrive number from being taken offline after the write.
-    validate_common_safety(selected, identity, snapshot)?;
-    if snapshot.number != expected.number
-        || snapshot.path != expected.path
-        || snapshot.serial_number != expected.serial_number
-        || snapshot.size != expected.size
-        || snapshot.logical_sector_size != expected.logical_sector_size
-        || snapshot.physical_sector_size != expected.physical_sector_size
-        || snapshot.bus_type != expected.bus_type
-        || snapshot.supports_removable_media != expected.supports_removable_media
+    if current.number != snapshot.number
+        || current.size != snapshot.size
+        || current.logical_sector_size != snapshot.logical_sector_size
+        || current.physical_sector_size != snapshot.physical_sector_size
+        || current.bus_type != snapshot.bus_type
+        || current.device_guid.iter().all(|byte| *byte == 0)
     {
+        return Err(WorkerError::TargetChanged);
+    }
+    Ok(())
+}
+
+fn validate_open_identity(
+    expected: &crate::windows_native::OpenDiskIdentity,
+    current: &crate::windows_native::OpenDiskIdentity,
+) -> Result<(), WorkerError> {
+    if current != expected {
         return Err(WorkerError::TargetChanged);
     }
     Ok(())
@@ -742,6 +785,17 @@ mod tests {
         }
     }
 
+    fn open_identity(snapshot: &DiskSnapshot) -> crate::windows_native::OpenDiskIdentity {
+        crate::windows_native::OpenDiskIdentity {
+            number: snapshot.number,
+            device_guid: [7; 16],
+            size: snapshot.size,
+            logical_sector_size: snapshot.logical_sector_size,
+            physical_sector_size: snapshot.physical_sector_size,
+            bus_type: snapshot.bus_type.clone(),
+        }
+    }
+
     #[test]
     fn stable_identity_round_trips() {
         let snapshot = snapshot();
@@ -750,6 +804,21 @@ mod tests {
         assert_eq!(identity.number, 7);
         assert_eq!(identity.device, r"\\.\PHYSICALDRIVE7");
         assert!(validate_snapshot(&selected, &identity, &snapshot, Some(false)).is_ok());
+    }
+
+    #[test]
+    fn native_handle_identity_survives_dismount_without_wmi() {
+        let snapshot = snapshot();
+        let pinned = open_identity(&snapshot);
+        assert!(validate_open_identity_against_snapshot(&snapshot, &pinned).is_ok());
+        assert!(validate_open_identity(&pinned, &pinned).is_ok());
+
+        let mut replacement = pinned.clone();
+        replacement.device_guid[0] ^= 0xff;
+        assert!(matches!(
+            validate_open_identity(&pinned, &replacement),
+            Err(WorkerError::TargetChanged)
+        ));
     }
 
     #[test]
