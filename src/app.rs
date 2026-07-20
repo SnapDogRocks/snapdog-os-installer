@@ -40,6 +40,10 @@ const DANGER: Color32 = Color32::from_rgb(255, 105, 97);
 const VERSION_CONTROL_WIDTH: f32 = 220.0;
 const WORKFLOW_CONNECTOR_WIDTH: f32 = 62.0;
 const STEP_ICON_CENTER_Y: f32 = 151.0;
+const SETUP_SOURCE_WIDTH: f32 = 380.0;
+const SETUP_STEP_WIDTH: f32 = 220.0;
+const SETUP_RIGHT_WIDTH: f32 = SETUP_STEP_WIDTH * 2.0 + WORKFLOW_CONNECTOR_WIDTH;
+const SETUP_CONTENT_WIDTH: f32 = SETUP_SOURCE_WIDTH + WORKFLOW_CONNECTOR_WIDTH + SETUP_RIGHT_WIDTH;
 const BOARD_GRID_WIDTH: f32 = 302.0;
 const BOARD_GRID_HEIGHT: f32 = 274.0;
 const WORKFLOW_OPTICAL_LEFT_SHIFT: f32 = 15.0;
@@ -838,44 +842,36 @@ impl SnapDogInstallerApp {
     }
 
     fn setup_screen(&mut self, ui: &mut egui::Ui) {
-        const SOURCE_WIDTH: f32 = 380.0;
-        const CONNECTOR_WIDTH: f32 = WORKFLOW_CONNECTOR_WIDTH;
-        const STEP_WIDTH: f32 = 220.0;
-        const RIGHT_WIDTH: f32 = STEP_WIDTH * 2.0 + CONNECTOR_WIDTH;
-        const CONTENT_WIDTH: f32 = SOURCE_WIDTH + CONNECTOR_WIDTH + RIGHT_WIDTH;
         const STEP_AREA_HEIGHT: f32 = 316.0;
 
         let content_height = ui.available_height();
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(
-                ((ui.available_width() - CONTENT_WIDTH) / 2.0 - WORKFLOW_OPTICAL_LEFT_SHIFT)
-                    .max(0.0),
-            );
+            ui.add_space(setup_content_left_inset(ui.available_width()));
             ui.allocate_ui_with_layout(
-                Vec2::new(SOURCE_WIDTH, content_height),
+                Vec2::new(SETUP_SOURCE_WIDTH, content_height),
                 Layout::top_down(Align::Center),
                 |ui| self.source_step(ui),
             );
             connector(ui, self.confirmed.is_some(), content_height);
             ui.allocate_ui_with_layout(
-                Vec2::new(RIGHT_WIDTH, content_height),
+                Vec2::new(SETUP_RIGHT_WIDTH, content_height),
                 Layout::top_down(Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.allocate_ui_with_layout(
-                        Vec2::new(RIGHT_WIDTH, STEP_AREA_HEIGHT),
+                        Vec2::new(SETUP_RIGHT_WIDTH, STEP_AREA_HEIGHT),
                         Layout::left_to_right(Align::Min),
                         |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             ui.allocate_ui_with_layout(
-                                Vec2::new(STEP_WIDTH, STEP_AREA_HEIGHT),
+                                Vec2::new(SETUP_STEP_WIDTH, STEP_AREA_HEIGHT),
                                 Layout::top_down(Align::Center),
                                 |ui| self.target_step(ui),
                             );
                             connector(ui, self.selected_drive.is_some(), STEP_AREA_HEIGHT);
                             ui.allocate_ui_with_layout(
-                                Vec2::new(STEP_WIDTH, STEP_AREA_HEIGHT),
+                                Vec2::new(SETUP_STEP_WIDTH, STEP_AREA_HEIGHT),
                                 Layout::top_down(Align::Center),
                                 |ui| self.flash_step(ui),
                             );
@@ -2322,11 +2318,21 @@ fn decode_notice_title(title: &str) -> String {
 fn setup_logo(ui: &egui::Ui) {
     let bounds = ui.max_rect();
     let size = snapdog_logo_size(210.0);
+    let content_left = bounds.left() + setup_content_left_inset(bounds.width());
+    let second_connector_center_x = content_left
+        + SETUP_SOURCE_WIDTH
+        + WORKFLOW_CONNECTOR_WIDTH
+        + SETUP_STEP_WIDTH
+        + WORKFLOW_CONNECTOR_WIDTH / 2.0;
     let center = egui::pos2(
-        bounds.width().mul_add(0.75, bounds.left()),
+        second_connector_center_x,
         bounds.bottom() - 64.0 - size.y / 2.0,
     );
     snapdog_logo_at(ui, egui::Rect::from_center_size(center, size), "setup-logo");
+}
+
+fn setup_content_left_inset(available_width: f32) -> f32 {
+    ((available_width - SETUP_CONTENT_WIDTH) / 2.0 - WORKFLOW_OPTICAL_LEFT_SHIFT).max(0.0)
 }
 
 fn operation_logo(ui: &egui::Ui) {
