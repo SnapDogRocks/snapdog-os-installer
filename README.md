@@ -9,8 +9,8 @@ A focused, native desktop application for installing
 
 Pick a Raspberry Pi model and a stable or beta SnapDog OS release, select exactly one removable
 target, and flash it. The image is downloaded only after confirmation, checked against the release
-metadata, written by a narrowly scoped administrator worker, verified by default, synced,
-and safely ejected or left unmounted.
+metadata, written by a narrowly scoped isolated worker using the platform's native authorization,
+verified by default, synced, and safely ejected or left unmounted.
 
 ## Downloads
 
@@ -33,7 +33,9 @@ the platform's native authorization mechanism, receives a fixed-shape job, and i
 revalidates the selected whole physical device immediately before destructive access. Stable media
 identity prevents a remove/reinsert race from redirecting a queued job.
 
-- macOS uses a Developer ID-verified privileged copy, `diskutil`, and I/O Registry media identity.
+- macOS verifies the signed application bundle, runs its worker without root privileges, and uses
+  Apple's `authopen` to grant access only to the selected raw-device descriptor. Target discovery
+  and identity validation use `diskutil` and the I/O Registry.
 - Linux uses PolicyKit, kernel `diskseq`, sysfs device identity, and mount/swap/holder protection.
   Linux kernel 5.15 or newer is required so path reuse can be detected without an unsafe fallback.
 - Windows uses native COM/WMI and Win32 storage APIs plus UAC, requires positive SD/MMC or
