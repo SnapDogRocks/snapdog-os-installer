@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDisplayName</key><string>SnapDog OS Installer</string>
-  <key>CFBundleExecutable</key><string>snapdog-os-installer</string>
+  <key>CFBundleExecutable</key><string>SnapDog OS Installer</string>
   <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundleIdentifier</key><string>cc.snapdog.os-installer</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>

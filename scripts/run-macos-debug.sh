@@ -17,7 +17,7 @@ LOG="$HOME/Library/Logs/SnapDog OS Installer/debug.log"
 cargo build --locked --profile diagnostic
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/diagnostic/snapdog-os-installer "$APP/Contents/MacOS/snapdog-os-installer"
+cp target/diagnostic/snapdog-os-installer "$APP/Contents/MacOS/SnapDog OS Installer"
 sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
 cp LICENSE "$APP/Contents/Resources/LICENSE"

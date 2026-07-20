@@ -28,7 +28,7 @@ const MAX_HELPER_STDERR: u64 = 256 * 1024;
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
 #[cfg(not(debug_assertions))]
 const WORKER_REQUIREMENT: &str = r#"identifier "cc.snapdog.os-installer" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "898G35U5LW""#;
-const WORKER_RELATIVE_PATH: &str = "Contents/MacOS/snapdog-os-installer";
+const WORKER_RELATIVE_PATH: &str = "Contents/MacOS/SnapDog OS Installer";
 const RAW_DEVICE_OPT_IN: &str = "SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE";
 const RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
 const AUTHOPEN: &str = "/usr/libexec/authopen";
@@ -768,7 +768,7 @@ mod tests {
             "SNAPDOG_INSTALLER_ALLOW_RAW_DEVICE_WRITE"
         );
         assert_eq!(RAW_DEVICE_OPT_IN_VALUE, "YES-I-UNDERSTAND");
-        assert_eq!(WORKER_RELATIVE_PATH, "Contents/MacOS/snapdog-os-installer");
+        assert_eq!(WORKER_RELATIVE_PATH, "Contents/MacOS/SnapDog OS Installer");
         assert_eq!(AUTHOPEN_RAW_FLAGS, "130");
     }
 

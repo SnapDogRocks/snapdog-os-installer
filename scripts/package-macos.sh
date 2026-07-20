@@ -95,8 +95,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create \
   target/aarch64-apple-darwin/release/snapdog-os-installer \
   target/x86_64-apple-darwin/release/snapdog-os-installer \
-  -output "$APP/Contents/MacOS/snapdog-os-installer"
-ARCHS=$(lipo -archs "$APP/Contents/MacOS/snapdog-os-installer")
+  -output "$APP/Contents/MacOS/$APP_NAME"
+ARCHS=$(lipo -archs "$APP/Contents/MacOS/$APP_NAME")
 if [[ "$ARCHS" != "arm64 x86_64" && "$ARCHS" != "x86_64 arm64" ]]; then
   echo "universal binary has unexpected architectures: $ARCHS" >&2
   exit 1
