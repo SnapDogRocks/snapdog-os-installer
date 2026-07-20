@@ -66,7 +66,7 @@ release_manifest = json.loads(
 )
 release_package = release_config["packages"]["."]
 assert release_config["bootstrap-sha"] == (
-    "3b44f02cf41dcce67f2918852c0047e796a4e1eb"
+    "f49f0fb9f78da3b7f5aae61f8b2f0b7931508a85"
 )
 assert release_package["release-type"] == "rust"
 assert release_package["initial-version"] == "0.1.0"
