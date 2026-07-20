@@ -1,0 +1,417 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # GitHub tag filters use glob syntax; the job below enforces the exact
+      # v<Cargo.toml version> contract.
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUSTFLAGS: -Dwarnings
+  RUST_VERSION: 1.88.0
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Match tag to Cargo package version
+        id: version
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "release tag must point to a commit contained in origin/main" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Require installer-ready public image manifests
+        run: ./scripts/check-live-manifests.py
+
+  quality:
+    name: Release quality gate
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Linux build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes --no-install-recommends
+          appstream desktop-file-utils libasound2-dev libudev-dev libwayland-dev libx11-xcb-dev
+          libxkbcommon-dev libxkbcommon-x11-dev libxcursor-dev libxi-dev
+          libxrandr-dev pkg-config shellcheck
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-quality
+      - name: Cache security tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-about
+            ~/.cargo/bin/cargo-deny
+          key: security-tools-about-0.9.0-audit-0.22.2-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
+      - name: Install security tools
+        run: |
+          command -v cargo-about >/dev/null || cargo install --locked --version 0.9.0 --features cli cargo-about
+          command -v cargo-audit >/dev/null || cargo install --locked --version 0.22.2 cargo-audit
+          command -v cargo-deny >/dev/null || cargo install --locked --version 0.20.2 cargo-deny
+      - name: Install pinned actionlint
+        run: |
+          install_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$install_dir"
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --status
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$install_dir" actionlint
+          echo "$install_dir" >> "$GITHUB_PATH"
+      - name: Run strict release quality gate
+        run: ./scripts/check.sh
+
+  linux:
+    name: Linux AppImage (${{ matrix.arch }})
+    needs: [validate-tag, quality]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            smoke_image: ubuntu@sha256:0d779ea97881505f5ef0039336ee85edba27519bdba968c284c86ee066a973c8
+            smoke_platform: linux/amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            smoke_image: ubuntu@sha256:ecd3706b6b5587d1318e1777359b8563f9db6e8e5a81841f04dc3c7edbefbdc1
+            smoke_platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build and test in pinned GLIBC 2.28 container
+        run: ./scripts/package-linux.sh --container "${{ matrix.target }}"
+      - name: Smoke-test AppImage in clean Ubuntu 22.04
+        run: |
+          docker run --rm --platform '${{ matrix.smoke_platform }}' \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            '${{ matrix.smoke_image }}' bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update >/dev/null
+              apt-get install --yes --no-install-recommends \
+                binutils ca-certificates libegl1 libgl1-mesa-dri xauth xvfb >/dev/null
+              ./packaging/linux/smoke-test-appimage.sh dist/*.AppImage
+            '
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows executable (${{ matrix.arch }})
+    needs: [validate-tag, quality]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            msvc_arch: x64
+            vs_component: Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            msvc_arch: arm64
+            vs_component: Microsoft.VisualStudio.Component.VC.Tools.ARM64
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust target
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
+          rustup default $env:RUST_VERSION
+          rustup target add '${{ matrix.target }}'
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+      - name: Run strict target checks and package executable
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = '-Dwarnings -C target-feature=+crt-static'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires '${{ matrix.vs_component }}' -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found.' }
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch '${{ matrix.msvc_arch }}' -HostArch amd64 -SkipAutomaticLocation
+          cargo clippy --locked --target '${{ matrix.target }}' --all-targets --all-features -- -D warnings
+          cargo check --locked --target '${{ matrix.target }}' --all-targets --all-features
+          if ('${{ matrix.arch }}' -eq 'x86_64') { cargo test --locked --all-features }
+          ./scripts/package-windows.ps1 -Target '${{ matrix.target }}'
+      - name: Upload unsigned executable for signing
+        if: vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-windows-${{ matrix.arch }}
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload unsigned release artifact
+        if: vars.AZURE_TRUSTED_SIGNING_ENABLED != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-sign:
+    name: Sign Windows executable (${{ matrix.arch }})
+    if: vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true'
+    needs: [validate-tag, windows]
+    runs-on: windows-2025
+    environment: release
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - name: Download unsigned executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-windows-${{ matrix.arch }}
+          path: ${{ runner.temp }}/windows
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign executable with Azure Artifact Signing
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ runner.temp }}\windows
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: SnapDog OS Installer
+          description-url: https://snapdog.cc
+      - name: Verify Authenticode signature
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -LiteralPath '${{ runner.temp }}\windows' -Filter '*.exe'
+          if ($files.Count -ne 1) { throw "Expected one executable, found $($files.Count)." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $files[0].FullName
+          if ($signature.Status -ne 'Valid') { throw "Invalid signature: $($signature.Status)" }
+      - name: Upload signed release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: ${{ runner.temp }}/windows/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: Signed and notarized macOS DMG
+    needs: [validate-tag, quality]
+    runs-on: macos-15
+    environment: release
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          rustup component add clippy rustfmt
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-macos-universal
+      - name: Install pinned DMG tooling
+        run: |
+          archive="$RUNNER_TEMP/create-dmg-1.2.2.tar.gz"
+          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
+            https://github.com/create-dmg/create-dmg/archive/refs/tags/v1.2.2.tar.gz \
+            --output "$archive"
+          echo '18e8dd7db06c9d6fb590c7877e1714b79b709f17d1d138bd65e4910cc82391bc  '"$archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          chmod 0755 "$RUNNER_TEMP/create-dmg-1.2.2/create-dmg"
+          echo "$RUNNER_TEMP/create-dmg-1.2.2" >> "$GITHUB_PATH"
+      - name: Run strict macOS checks
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo clippy --locked --target aarch64-apple-darwin --all-targets --all-features -- -D warnings
+          cargo clippy --locked --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+      - name: Build, sign, notarize, and staple DMG
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: ./scripts/package-macos.sh
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos
+          path: dist/*-macos-universal.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate-tag, quality, linux, windows, windows-sign, macos]
+    if: >-
+      ${{ always() &&
+          needs.validate-tag.result == 'success' &&
+          needs.quality.result == 'success' &&
+          needs.linux.result == 'success' &&
+          needs.windows.result == 'success' &&
+          needs.macos.result == 'success' &&
+          (needs.windows-sign.result == 'success' || needs.windows-sign.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      WINDOWS_SIGNED: ${{ vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true' }}
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ needs.validate-tag.outputs.version }}'
+          expected=(
+            "snapdog-os-installer-$version-linux-x86_64.AppImage"
+            "snapdog-os-installer-$version-linux-aarch64.AppImage"
+            "snapdog-os-installer-$version-windows-x86_64.exe"
+            "snapdog-os-installer-$version-windows-aarch64.exe"
+            "snapdog-os-installer-$version-macos-universal.dmg"
+          )
+          for asset in "${expected[@]}"; do
+            test -s "release-assets/$asset" || {
+              echo "missing or empty release asset: $asset" >&2
+              exit 1
+            }
+          done
+          if [[ $(find release-assets -maxdepth 1 -type f | wc -l) -ne ${#expected[@]} ]]; then
+            echo "unexpected files in release asset set" >&2
+            find release-assets -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum -- * > SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release-assets/*
+      - name: Generate release notes with signing status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$RUNNER_TEMP/generated-notes.md"
+          {
+            if [[ "$WINDOWS_SIGNED" == "true" ]]; then
+              echo "> [!NOTE]"
+              echo "> The Windows executables in this release are signed with Azure Artifact Signing."
+            else
+              echo "> [!WARNING]"
+              echo "> **The Windows executables in this release are unsigned.** Verify \`SHA256SUMS\` before running them. Azure Artifact Signing is prepared but not enabled for this release."
+            fi
+            echo
+            cat "$RUNNER_TEMP/generated-notes.md"
+          } > "$RUNNER_TEMP/release-notes.md"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="SnapDog OS Installer ${{ needs.validate-tag.outputs.version }}"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Release Please creates a draft release and force-creates its tag so
+            # this packaging workflow can run. Keep it private until every asset
+            # and attestation has passed, then publish it as the final operation.
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --title "$title" \
+              --verify-tag
+          else
+            # Preserve the documented manual-tag recovery path.
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --title "$title"
+          fi

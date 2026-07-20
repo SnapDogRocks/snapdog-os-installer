@@ -2,42 +2,96 @@
 
 SnapDog OS Installer is one Rust executable with two runtime modes:
 
-1. The unprivileged `egui` application selects an OS image and exactly one removable target.
-2. The same executable will re-launch in a narrowly scoped privileged worker mode for unmounting
-   and writing that selected target. There is no separately shipped sidecar.
+1. The unprivileged `egui` application selects one OS image and exactly one removable target.
+2. The same executable re-enters through the native administrator flow to perform the minimum
+   privileged operations required to unmount, write, verify, sync, and eject that target.
 
-The worker boundary is deliberately not connected in the first local milestone. The current flash
-pipeline is exercised only against ordinary temporary files.
+There is no separately shipped sidecar. macOS, Linux, and Windows all use the same serialized job
+and JSON-lines progress protocol, while target discovery, elevation, and raw-device handling remain
+small platform modules.
 
 ## Image pipeline
 
-- Load stable and beta release manifests without downloading image archives.
-- Select the newest available version by default.
-- Download only after the user presses **Flash**.
-- Verify the compressed archive SHA-256 before opening the target.
-- Decompress with a bounded buffer and refuse writes beyond the reported target capacity.
-- Verify written bytes by default; an explicit skip produces a visible **Not verified** result.
+- Stable and beta manifests are loaded without downloading image archives.
+- The newest compatible version is selected by default.
+- Download starts only after the user confirms the destructive operation.
+- The compressed size and SHA-256 are checked while streaming to a private temporary file.
+- The archive is decompressed with a bounded buffer; raw size and SHA-256 are checked before
+  administrator authorization is requested.
+- The privileged worker treats every serialized path as untrusted. It copies the prepared raw image
+  into an unlinked staging file and hashes it again before enumerating the target.
+- The target must be large enough before elevation. Written bytes are verified by default; an
+  explicit skip produces a visible **Not verified** result.
 
-The release manifest should grow immutable versioned image URLs, compressed and uncompressed
-sizes, and a raw-image SHA-256 before the privileged writer is enabled.
+Release manifest v2 supplies immutable, versioned HTTPS URLs plus compressed and raw sizes and
+hashes. Schema v1 remains readable for catalog compatibility but cannot enter the destructive path
+without the v2 integrity fields.
 
 ## Target safety
 
-- Exactly one whole physical drive can be selected.
-- macOS queries only `diskutil list -plist external physical` results.
-- Linux queries removable whole devices in `/sys/block`.
-- Windows queries USB/SD disks and rejects `IsBoot` and `IsSystem` disks.
-- Device identifiers are syntax-checked before they can cross the worker boundary.
-- The worker must re-enumerate the target immediately before writing and compare its stable
-  identity and capacity with the user's selection.
-- Cancellation is checked between every buffered read/write operation.
+Common invariants:
 
-## Packaging
+- only one whole physical device can be selected;
+- boot/system, fixed, virtual, read-only, mounted system, and otherwise ambiguous devices fail
+  closed;
+- every device identifier is syntax-checked and all raw paths are derived internally;
+- target identity and capacity are revalidated before unmount, after unmount, and after the raw
+  descriptor is opened;
+- cancellation is checked between bounded reads and writes;
+- every exit after destructive access best-effort syncs the open target and then attempts the
+  platform cleanup path. Cleanup failures never hide the primary write, verification, or cancel
+  result; on platforms/controllers without power-off support the card can remain safely unmounted
+  rather than appearing as successfully ejected.
 
-- macOS: one universal application (`arm64` + `x86_64`) in a signed, hardened, notarized DMG.
-- Windows: separate ARM64 and x86-64 executables, prepared for Azure Artifact Signing through
-  GitHub OIDC.
-- Linux: separate ARM64 and x86-64 AppImages.
+Platform identity:
 
-Release automation remains disabled until local removable-media write and verification tests have
-passed on every platform.
+- **macOS:** `diskutil list -plist physical` is intersected with I/O Registry media marked exactly
+  whole, writable, removable, and ejectable. The whole-media `IORegistryEntryID` survives the
+  privilege boundary and detects device-path reuse, including Apple's built-in SDXC reader.
+- **Linux:** `/sys/block` must report a writable removable whole block device with a positive kernel
+  `diskseq`. Device numbers, partitions, transitive holders, protected mounts, and swap are checked;
+  the opened block descriptor is revalidated against sysfs before writing.
+- **Windows:** the Storage Management WMI provider must report a writable, online SD/MMC device, or
+  a USB device whose `Win32_DiskDrive` capabilities positively identify removable media. Ordinary
+  USB HDDs and SSDs are excluded even when externally attached. A fingerprint binds disk number,
+  capacity, logical and physical sector geometry, bus, device path, unique ID, serial number, and
+  removable capability. Native volume enumeration and disk-extent IOCTLs identify the target's
+  filesystems; each volume is locked and dismounted with `FSCTL_LOCK_VOLUME` and
+  `FSCTL_DISMOUNT_VOLUME`, and the physical drive is then opened exclusively with write-through
+  semantics. Verification reopens the target with unbuffered, sector-aligned reads. The locked
+  volume handles remain alive until cleanup, so a pre-write failure restores normal access simply
+  by closing them.
+
+## Privilege boundary
+
+- Raw-device mode requires an exact, digest-bound worker CLI. The worker additionally proves root
+  or Administrator identity. macOS uses a launcher-only environment opt-in; Windows uses a fixed
+  CLI opt-in; Linux deliberately transports neither arbitrary environment nor a generic helper
+  command through PolicyKit.
+- Job, raw image, progress, cancel, and verification-skip paths are fixed-name members of one
+  private session directory.
+- Unix validates directory owner, mode, parent identity, link count, file type, size, and stable
+  device/inode identity. Linux also permits only the root-owned sticky `/tmp` parent shape.
+- Windows rejects reparse points and pins the session directory and opened files with native file
+  identity handles across the UAC hand-off.
+- Progress records and helper diagnostics are size-bounded. Monitoring failures create a durable
+  cancel marker and wait for the worker so temporary state cannot disappear under a privileged
+  process.
+- macOS copies the signed application into a root-owned directory, verifies its Developer ID
+  designated requirement, and binds the worker job to a SHA-256 digest across the administrator
+  prompt. Linux invokes a constant program through a validated, root-owned `pkexec`/`bash` toolchain;
+  that program copies the pre-hashed executable into a private root-owned directory, verifies the
+  copy, and passes the digest-bound job to it. Windows invokes UAC directly through
+  `ShellExecuteExW`, with a constant executable and separately quoted native arguments. Discovery,
+  elevation, volume locking, dismount, writing, and verification never invoke a command shell.
+
+## Tests and release gates
+
+Unit and integration tests write only to ordinary files. Platform worker modules additionally test
+identity parsing, hotplug/path-reuse rejection, progress framing, and command argument construction.
+A release requires strict Clippy, tests on Linux/macOS/Windows, Rust 1.88 compatibility, dependency
+audit, native ARM64/x86-64 package builds, a notarized universal DMG, the exact five-asset set,
+checksums, and build-provenance attestations.
+
+A physical-media end-to-end test is intentionally manual and must use an explicitly designated
+disposable SD card; the test suite never infers permission to write an attached device.

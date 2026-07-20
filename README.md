@@ -1,10 +1,53 @@
 # SnapDog OS Installer
 
-Pure Rust desktop application for downloading and writing the correct
-[SnapDog OS](https://github.com/SnapDogRocks/snapdog-os) image to an SD card.
+[![CI](https://github.com/SnapDogRocks/snapdog-os-installer/actions/workflows/ci.yml/badge.svg)](https://github.com/SnapDogRocks/snapdog-os-installer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SnapDogRocks/snapdog-os-installer?display_name=tag)](https://github.com/SnapDogRocks/snapdog-os-installer/releases)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-The project targets macOS, Windows, and Linux on ARM64 and x86-64. It is currently in a
-local-only development phase: no public installer artifacts are produced yet.
+A focused, native desktop application for installing
+[SnapDog OS](https://github.com/SnapDogRocks/snapdog-os) on a Raspberry Pi SD card.
+
+Pick a Raspberry Pi model and a stable or beta SnapDog OS release, select exactly one removable
+target, and flash it. The image is downloaded only after confirmation, checked against the release
+metadata, written by a narrowly scoped isolated worker using the platform's native authorization,
+verified by default, synced, and safely ejected or left unmounted.
+
+## Downloads
+
+Each tagged release is built as one Rust executable per platform package:
+
+- macOS: signed and notarized universal DMG (`arm64` + `x86_64`)
+- Windows: standalone `arm64` and `x86_64` executables
+- Linux: standalone `arm64` and `x86_64` AppImages
+
+Release assets include SHA-256 checksums and GitHub build-provenance attestations. Windows release
+signing is ready for Azure Artifact Signing and can be enabled once the SnapDog signing account is
+provisioned; until then the Windows executables are clearly published unsigned.
+The GPL license and generated third-party notices are embedded in every package and available from
+the application's Settings screen; the Windows executables retain the one-file distribution model.
+
+## Safety model
+
+The graphical application never writes a raw device directly. The same binary is re-entered through
+the platform's native authorization mechanism, receives a fixed-shape job, and independently
+revalidates the selected whole physical device immediately before destructive access. Stable media
+identity prevents a remove/reinsert race from redirecting a queued job.
+
+- macOS verifies the signed application bundle, runs its worker without root privileges, and uses
+  Apple's `authopen` to grant access only to the selected raw-device descriptor. Target discovery
+  and identity validation use `diskutil` and the I/O Registry.
+- Linux uses PolicyKit, kernel `diskseq`, sysfs device identity, and mount/swap/holder protection.
+  Linux kernel 5.15 or newer is required so path reuse can be detected without an unsafe fallback.
+- Windows uses native COM/WMI and Win32 storage APIs plus UAC, requires positive SD/MMC or
+  removable USB identity, and verifies through sector-aligned unbuffered reads after an exclusive
+  write-through physical-disk write. Boot, system, read-only, fixed, and ambiguous USB disks are
+  rejected. No command shell participates in discovery, authorization, dismount, writing, or
+  verification.
+
+The automated tests use ordinary temporary files and never open a real device. See
+[Architecture and safety model](docs/architecture.md) for the complete boundary and failure model,
+and [Physical platform validation](docs/platform-validation.md) for the mandatory disposable-media
+release checklist.
 
 ## Development
 
@@ -15,20 +58,29 @@ cargo run
 ./scripts/check.sh
 ```
 
-The current local milestone provides the complete branded image chooser, live stable/beta catalog
-loading, and read-only discovery of removable physical drives. Boot and system drives are excluded
-by the platform backends. The destructive privileged worker is intentionally not enabled yet; core
-flash tests use ordinary temporary files and never write real disks.
+`scripts/check.sh` enforces formatting, all/pedantic/nursery Clippy lints, warnings-as-errors,
+tests, the Rust 1.88 minimum version, and mandatory license, advisory, and dependency auditing.
 
-See [Architecture](docs/architecture.md) for the safety model and remaining local milestones.
+Platform packages are produced with:
 
-## Distribution plan
+```bash
+./scripts/package-macos.sh
+./scripts/package-linux.sh x86_64-unknown-linux-gnu
+pwsh ./scripts/package-windows.ps1 -Target x86_64-pc-windows-msvc
+```
 
-- macOS: signed and notarized universal DMG
-- Windows: standalone x86-64 and ARM64 executables, prepared for Azure Artifact Signing
-- Linux: x86-64 and ARM64 AppImages
+The macOS script requires the Developer ID and App Store Connect API values documented in the
+release workflow. Linux AppImages must be assembled natively on the matching architecture. Windows
+packages must be built from an MSVC developer shell.
 
-No release workflow is enabled while destructive-device handling is still under local test.
+## Releasing
+
+Release Please maintains the package version, `Cargo.lock`, and `CHANGELOG.md` in a release pull
+request. The release PR is deliberately never auto-merged. Merging it creates a matching `vX.Y.Z`
+tag and a private draft release; the tag builds all five packages, signs and notarizes macOS,
+optionally signs Windows through GitHub OIDC, checks the complete asset set, creates checksums and
+attestations, and publishes the release only after every gate succeeds. See
+[Release configuration](docs/releasing.md).
 
 ## License
 

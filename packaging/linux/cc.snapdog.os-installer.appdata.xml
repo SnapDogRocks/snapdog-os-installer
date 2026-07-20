@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>cc.snapdog.os-installer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>SnapDog OS Installer</name>
+  <summary>Download and write SnapDog OS images to SD cards</summary>
+  <description>
+    <p>
+      SnapDog OS Installer guides you through selecting a Raspberry Pi model,
+      downloading the matching SnapDog OS image, and writing it to an SD card.
+    </p>
+  </description>
+  <launchable type="desktop-id">cc.snapdog.os-installer.desktop</launchable>
+  <url type="homepage">https://snapdog.cc</url>
+  <url type="bugtracker">https://github.com/SnapDogRocks/snapdog-os-installer/issues</url>
+  <developer id="cc.snapdog">
+    <name>SnapDog</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+</component>

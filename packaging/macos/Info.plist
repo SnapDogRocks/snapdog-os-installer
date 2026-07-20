@@ -14,5 +14,7 @@
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>SnapDog OS Installer needs access to removable volumes to write and verify SnapDog OS on the selected SD card.</string>
 </dict>
 </plist>
