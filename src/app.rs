@@ -2588,10 +2588,11 @@ mod tests {
 
     #[test]
     fn acknowledgements_accept_windows_line_endings() {
-        let windows_notices = THIRD_PARTY_NOTICES.replace('\n', "\r\n");
+        let normalized_notices = THIRD_PARTY_NOTICES.replace("\r\n", "\n");
+        let windows_notices = normalized_notices.replace('\n', "\r\n");
         assert_eq!(
             third_party_license_groups(&windows_notices).len(),
-            third_party_license_groups(THIRD_PARTY_NOTICES).len()
+            third_party_license_groups(&normalized_notices).len()
         );
     }
 }
