@@ -20,6 +20,7 @@ fix(macos): preserve dock icon transparency
 refactor(worker)!: remove the legacy protocol
 ```
 
-CI validates every commit in a pull request as well as its title. Repository
-branch protection should require the **Conventional commits** check before
-merging. Commits preceding the introduction of this policy are grandfathered.
+CI validates every commit in a pull request as well as its title. The `main`
+branch ruleset requires the complete CI matrix and allows squash merges only,
+so the validated pull-request title becomes the commit subject on `main`.
+Commits preceding the introduction of this policy are grandfathered.
