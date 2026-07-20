@@ -158,7 +158,7 @@ assert static_windows_flags in release_workflow
 
 info = plistlib.loads((root / "packaging/macos/Info.plist").read_bytes())
 assert info["CFBundleIdentifier"] == "cc.snapdog.os-installer"
-assert info["CFBundleExecutable"] == "snapdog-os-installer"
+assert info["CFBundleExecutable"] == "SnapDog OS Installer"
 assert info["CFBundleShortVersionString"] == "__VERSION__"
 assert info["NSRemovableVolumesUsageDescription"] == (
     "SnapDog OS Installer needs access to removable volumes to write and verify "
