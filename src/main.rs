@@ -376,8 +376,17 @@ fn run_worker(_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WINDOW_ICON_BYTES: &[u8] = include_bytes!("../assets/icon-windows.png");
+
+#[cfg(target_os = "windows")]
+const APPLICATION_ICON_BYTES: &[u8] = WINDOW_ICON_BYTES;
+
+#[cfg(not(target_os = "windows"))]
+const APPLICATION_ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+
 fn load_icon() -> egui::IconData {
-    let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+    let image = image::load_from_memory(APPLICATION_ICON_BYTES)
         .expect("embedded application icon must be valid")
         .into_rgba8();
     let (width, height) = image.dimensions();
@@ -391,6 +400,18 @@ fn load_icon() -> egui::IconData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_runtime_icon_has_transparency() {
+        let icon = image::load_from_memory(WINDOW_ICON_BYTES)
+            .expect("Windows application icon must be valid")
+            .into_rgba8();
+
+        assert!(
+            icon.pixels().any(|pixel| pixel.0[3] == 0),
+            "Windows application icon must not contain an opaque background"
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn valid_worker_arguments(path: &str) -> Vec<OsString> {

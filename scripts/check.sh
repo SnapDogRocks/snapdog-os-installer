@@ -180,8 +180,13 @@ assert png_dimensions(root / "packaging/linux/cc.snapdog.os-installer.png") == (
     512,
 )
 assert png_dimensions(root / "assets/icon.png") == (1024, 1024)
+assert png_dimensions(root / "assets/icon-windows.png") == (1024, 1024)
 assert png_dimensions(root / "assets/icon-macos.png") == (1024, 1024)
 assert png_dimensions(root / "assets/dmg/background.png") == (600, 400)
 assert (root / "assets/icon.icns").read_bytes()[:4] == b"icns"
 assert (root / "assets/icon.ico").read_bytes()[:4] == b"\x00\x00\x01\x00"
+
+main_source = (root / "src/main.rs").read_text()
+assert '#[cfg(target_os = "windows")]' in main_source
+assert 'include_bytes!("../assets/icon-windows.png")' in main_source
 PY
