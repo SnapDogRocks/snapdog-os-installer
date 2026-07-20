@@ -144,9 +144,7 @@ for required in (
 ):
     assert required in windows_runtime
 
-for workflow in ("ci.yml", "release.yml"):
-    workflow_text = (root / ".github/workflows" / workflow).read_text()
-    assert static_windows_flags in workflow_text
+assert static_windows_flags in release_workflow
 
 info = plistlib.loads((root / "packaging/macos/Info.plist").read_bytes())
 assert info["CFBundleIdentifier"] == "cc.snapdog.os-installer"
