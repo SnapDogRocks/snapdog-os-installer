@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(all(debug_assertions, target_os = "macos"))]
+#[cfg(any(all(debug_assertions, target_os = "macos"), target_os = "windows"))]
 use std::sync::Mutex;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -49,10 +49,11 @@ fn init_tracing(worker_reentry: bool) -> io::Result<()> {
     let filter = if cfg!(debug_assertions) {
         // A machine-level `RUST_LOG` must not silently suppress the diagnostics this explicitly
         // instrumented build exists to collect.
-        tracing_subscriber::EnvFilter::new("snapdog_os_installer=debug,info")
+        tracing_subscriber::EnvFilter::new("warn,snapdog_os_installer=debug")
     } else {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("warn,snapdog_os_installer=info")
+        })
     };
 
     #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -82,15 +83,52 @@ fn init_tracing(worker_reentry: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    let _ = worker_reentry;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_target(true)
-        .with_thread_ids(true)
-        .try_init()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+    #[cfg(target_os = "windows")]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::other("LOCALAPPDATA is unavailable for the Windows log"))?;
+        let directory = local_app_data.join("SnapDog OS Installer").join("Logs");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("installer.log");
+        if !worker_reentry
+            && let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_writer(Mutex::new(file))
+            .try_init()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        tracing::info!(
+            log_path = %path.display(),
+            worker_reentry,
+            "Windows file logging initialized"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = worker_reentry;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .try_init()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    }
 }
 
 fn run_gui() -> eframe::Result {
