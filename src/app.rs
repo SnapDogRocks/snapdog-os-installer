@@ -2331,6 +2331,7 @@ fn third_party_license_card(ui: &mut egui::Ui, index: usize, license: &ThirdPart
 }
 
 fn third_party_license_groups(notices: &str) -> Vec<ThirdPartyLicenseGroup> {
+    let notices = notices.replace("\r\n", "\n");
     let mut groups: Vec<ThirdPartyLicenseGroup> = Vec::new();
     for section in notices
         .split("================================================================================")
@@ -2583,5 +2584,14 @@ mod tests {
                 .any(|license| license.title.contains("MIT") && !license.packages.is_empty())
         );
         assert_eq!(decode_notice_title("BSD &quot;New&quot;"), "BSD \"New\"");
+    }
+
+    #[test]
+    fn acknowledgements_accept_windows_line_endings() {
+        let windows_notices = THIRD_PARTY_NOTICES.replace('\n', "\r\n");
+        assert_eq!(
+            third_party_license_groups(&windows_notices).len(),
+            third_party_license_groups(THIRD_PARTY_NOTICES).len()
+        );
     }
 }
