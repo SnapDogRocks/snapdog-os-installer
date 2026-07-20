@@ -116,6 +116,14 @@ assert 'mv -f "$UNVALIDATED_DMG" "$DMG"' in macos_packager
 build_script = (root / "build.rs").read_text()
 assert 'CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")' in build_script
 assert 'requestedExecutionLevel level=\"asInvoker\"' in build_script
+for version_field in ("FileVersion", "ProductVersion"):
+    assert f'resource.set("{version_field}", &version)' in build_script
+for metadata_value in (
+    "SnapDog OS Installer",
+    "snapdog-os-installer.exe",
+    "Copyright © 2026 Fabian Schmieder",
+):
+    assert metadata_value in build_script
 
 windows_packager = (root / "scripts/package-windows.ps1").read_text()
 static_windows_flags = "-Dwarnings -C target-feature=+crt-static"
@@ -123,6 +131,8 @@ assert static_windows_flags in windows_packager
 assert "dumpbin.exe" in windows_packager
 assert "$TemporaryOutput" in windows_packager
 assert "Move-Item -Force -LiteralPath $TemporaryOutput -Destination $Output" in windows_packager
+assert "$VersionInfo.FileVersion -ne $Package.version" in windows_packager
+assert "$VersionInfo.ProductVersion -ne $Package.version" in windows_packager
 for runtime_name in ("vcruntime", "msvcp", "msvcr", "concrt", "ucrtbase", "api-ms-win-crt-"):
     assert runtime_name in windows_packager.lower()
 
