@@ -57,8 +57,16 @@ RUNNER_TEMP=${RUNNER_TEMP%/}
 WORK_DIR=""
 OUTPUT_DIR=""
 KEYCHAIN=""
+ORIGINAL_DEFAULT_KEYCHAIN=""
+ORIGINAL_KEYCHAINS=()
 
 cleanup() {
+  if [[ ${#ORIGINAL_KEYCHAINS[@]} -gt 0 ]]; then
+    security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$ORIGINAL_DEFAULT_KEYCHAIN" ]]; then
+    security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$KEYCHAIN" && -f "$KEYCHAIN" ]]; then
     security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
   fi
@@ -70,6 +78,15 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+while IFS= read -r original_keychain; do
+  original_keychain=${original_keychain#*\"}
+  original_keychain=${original_keychain%\"*}
+  if [[ -n "$original_keychain" ]]; then
+    ORIGINAL_KEYCHAINS+=("$original_keychain")
+  fi
+done < <(security list-keychains -d user)
+ORIGINAL_DEFAULT_KEYCHAIN=$(security default-keychain -d user | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
 
 mkdir -p "$RUNNER_TEMP" "$ROOT/dist"
 WORK_DIR=$(mktemp -d "$RUNNER_TEMP/snapdog-installer-package.XXXXXX")
@@ -107,20 +124,30 @@ cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp THIRD_PARTY_NOTICES.txt "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
 chmod -R u+rwX,go+rX "$APP"
 
+echo "Creating isolated signing keychain"
 KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 security set-keychain-settings -lut 21600 "$KEYCHAIN"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+security list-keychains -d user -s "$KEYCHAIN" "${ORIGINAL_KEYCHAINS[@]}"
+security default-keychain -d user -s "$KEYCHAIN"
 if [[ -f "$MACOS_CERT_P12" ]]; then
   cp "$MACOS_CERT_P12" "$CERT_FILE"
 else
   printf '%s' "$MACOS_CERT_P12" | openssl base64 -d -A -out "$CERT_FILE"
 fi
+echo "Importing Developer ID identity"
 security import "$CERT_FILE" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign >/dev/null
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
 SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)
-test -n "$SIGN_IDENTITY"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  echo "the PKCS#12 did not provide a usable Developer ID Application identity and private key" >&2
+  security find-identity -v -p codesigning "$KEYCHAIN" >&2 || true
+  exit 1
+fi
+echo "Configuring signing-key access"
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
 
+echo "Signing macOS application bundle"
 codesign --force --options runtime --timestamp \
   --keychain "$KEYCHAIN" \
   --entitlements packaging/macos/entitlements.plist \

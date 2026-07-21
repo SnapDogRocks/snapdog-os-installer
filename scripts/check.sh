@@ -112,6 +112,12 @@ assert '"-R=$WORKER_REQUIREMENT"' in macos_packager
 assert "umask 077" in macos_packager
 assert "UNVALIDATED_DMG" in macos_packager
 assert 'mv -f "$UNVALIDATED_DMG" "$DMG"' in macos_packager
+assert 'security list-keychains -d user -s "$KEYCHAIN"' in macos_packager
+assert 'security default-keychain -d user -s "$KEYCHAIN"' in macos_packager
+assert "did not provide a usable Developer ID Application identity" in macos_packager
+assert macos_packager.index("SIGN_IDENTITY=$(security find-identity") < (
+    macos_packager.index("security set-key-partition-list")
+)
 
 build_script = (root / "build.rs").read_text()
 assert 'CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")' in build_script
