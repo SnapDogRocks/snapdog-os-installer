@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.1.1...v0.2.0) (2026-07-21)
+
+
+### Features
+
+* **platform:** replace external disk tools with native APIs ([#10](https://github.com/SnapDogRocks/snapdog-os-installer/issues/10)) ([0723bff](https://github.com/SnapDogRocks/snapdog-os-installer/commit/0723bfffebbc6ccce569d20e2bd2877ee7899f12))
+
 ## [0.1.1](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.1.0...v0.1.1) (2026-07-21)
 
 
