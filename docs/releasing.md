@@ -56,6 +56,20 @@ The publish job then adds `SHA256SUMS`, creates GitHub build-provenance attestat
 generated release notes. Failed, missing, empty, duplicated, or unexpected package artifacts stop
 the release.
 
+## Website release handoff
+
+After the GitHub release has passed every package, signing, notarization, checksum, attestation, and
+asset-contract gate and has been made public, the final publish step dispatches
+`update-installer-release.yml` on `SnapDogRocks/snapdog-web`. That workflow validates the published
+asset set, updates the shared download metadata and version number, verifies the website, and opens
+an auto-merge pull request. Draft or failed installer releases never trigger the website update.
+
+The installer repository must define the Actions secret `SNAPDOG_RELEASE_AUTOMATION_TOKEN`. Use the
+same dedicated automation token configured under that name in `snapdog-web`; it needs permission to
+dispatch Actions workflows in `SnapDogRocks/snapdog-web`. The release publish job checks that the
+secret exists before making a release public, preventing a successful release from silently leaving
+the website on an older version.
+
 Windows ARM64 is cross-compiled by the native MSVC ARM64 toolchain on an x86-64 GitHub runner. Its
 compile, lint, static-runtime, and PE dependency gates are automated, but the resulting application
 must still pass the native Windows-on-ARM disposable-media checklist before the first public tag.
