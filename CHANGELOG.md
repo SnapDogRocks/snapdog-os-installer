@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.1.0...v0.1.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* **macos:** register release signing keychain ([20ff370](https://github.com/SnapDogRocks/snapdog-os-installer/commit/20ff3706d5525e7af52b673b12297ac99d5d439c))
+
 ## 0.1.0 (2026-07-20)
 
 

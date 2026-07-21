@@ -7878,7 +7878,7 @@ insights.
 GNU General Public License v3.0 only (GPL-3.0-only)
 
 Used by:
-- snapdog-os-installer 0.1.0
+- snapdog-os-installer (application)
 
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007
