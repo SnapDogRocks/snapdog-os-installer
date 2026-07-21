@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.0...v0.2.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* **linux:** enable worker AppImage smoke test ([#12](https://github.com/SnapDogRocks/snapdog-os-installer/issues/12)) ([84149c0](https://github.com/SnapDogRocks/snapdog-os-installer/commit/84149c0da4a6822b950fb604094a130af54b62bb))
+
 ## [0.2.0](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.1.1...v0.2.0) (2026-07-21)
 
 
