@@ -329,6 +329,16 @@ jobs:
     env:
       WINDOWS_SIGNED: ${{ vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true' }}
     steps:
+      - name: Require website release automation token
+        shell: bash
+        env:
+          WEBSITE_AUTOMATION_TOKEN: ${{ secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${WEBSITE_AUTOMATION_TOKEN:-}" ]]; then
+            echo "SNAPDOG_RELEASE_AUTOMATION_TOKEN must be configured before publishing a release" >&2
+            exit 1
+          fi
       - name: Download release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -411,3 +421,13 @@ jobs:
               --notes-file "$RUNNER_TEMP/release-notes.md" \
               --title "$title"
           fi
+      - name: Update SnapDog website release links
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run update-installer-release.yml \
+            --repo SnapDogRocks/snapdog-web \
+            --ref main \
+            -f tag="$GITHUB_REF_NAME"
