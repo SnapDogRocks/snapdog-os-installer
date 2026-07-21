@@ -19,6 +19,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+require_text() {
+  local expected
+  local path
+  local description
+  expected=$1
+  path=$2
+  description=$3
+  if ! grep -F "$expected" "$path" >/dev/null; then
+    echo "$description" >&2
+    sed -n '1,160p' "$path" >&2
+    exit 1
+  fi
+}
+
 (
   cd "$WORK"
   "$APPIMAGE" --appimage-extract >/dev/null
@@ -117,18 +131,27 @@ bad_digest_status=$?
 set -e
 test "$bad_digest_status" -eq 1
 test ! -s "$SESSION/worker-progress.jsonl"
-grep -F 'worker job changed during interactive authorization' \
-  "$WORK/bad-digest.stderr" >/dev/null
+require_text \
+  'worker job changed during interactive authorization' \
+  "$WORK/bad-digest.stderr" \
+  'worker rejected the invalid digest without the expected diagnostic'
 
 set +e
-APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" \
+SNAPDOG_INSTALLER_ALLOW_UDISKS_WRITE=YES-I-UNDERSTAND \
+  APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE" \
   --worker-job "$SESSION/worker-job.json" \
   --worker-job-sha256 "$job_sha256" \
   >"$WORK/worker.stdout" 2>"$WORK/worker.stderr"
 worker_status=$?
 set -e
 test "$worker_status" -eq 1
-grep -F '"phase":"cancelled"' "$SESSION/worker-progress.jsonl" >/dev/null
-grep -F 'Error: Cancelled' "$WORK/worker.stderr" >/dev/null
+require_text \
+  '"phase":"cancelled"' \
+  "$SESSION/worker-progress.jsonl" \
+  'worker did not report cancellation through the progress channel'
+require_text \
+  'Error: Cancelled' \
+  "$WORK/worker.stderr" \
+  'worker did not return the expected cancellation diagnostic'
 
 echo "AppImage smoke test passed (maximum required GLIBC_$max_glibc)"
