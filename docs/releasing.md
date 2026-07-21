@@ -36,9 +36,9 @@ Apple credentials are exposed only to that packaging step. The local script impo
 named values and removes them from the exported environment before Cargo, build scripts, and DMG
 tooling run.
 
-The GitHub `release` environment requires approval by its configured reviewer and accepts only
-deployments originating from `v*` tags. Keep those protections enabled; they are part of the signing
-boundary, not optional repository decoration.
+The GitHub `release` environment stores the Apple signing secrets and accepts only deployments
+originating from `v*` tags. It intentionally has no required-reviewer rule, so a validated release
+tag proceeds through signing and notarization without a manual approval pause.
 
 Windows Azure configuration is documented in [windows-signing.md](windows-signing.md).
 

@@ -76,7 +76,7 @@ pub enum ProgressDestination {
     File { path: PathBuf },
 }
 
-/// Serializable request accepted by the privileged worker.
+/// Serializable request accepted by the isolated same-executable writer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerJob {
     pub schema_version: u32,
@@ -164,7 +164,7 @@ impl WorkerProgress {
     }
 }
 
-/// Failures at the privileged worker boundary.
+/// Failures at the isolated writer boundary.
 #[derive(Debug, Error)]
 pub enum WorkerError {
     #[error("invalid worker job: {0}")]
@@ -212,26 +212,14 @@ impl RawDeviceGate {
         Ok(Self { _private: () })
     }
 
-    /// Validate the root identity supplied by `PolicyKit`.
-    ///
-    /// Linux deliberately does not transport the accidental-write environment opt-in through a
-    /// generic elevated `env` process. The exact worker CLI, private session contract, root token,
-    /// and worker-side target revalidation form the authorization boundary instead.
+    /// Validate the accidental-write opt-in supplied only to the same-executable Linux worker.
+    /// `UDisks2` independently performs the authoritative `PolicyKit` checks for destructive calls.
     #[cfg(target_os = "linux")]
     pub fn from_environment() -> Result<Self, WorkerError> {
-        Self::from_root_worker()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn from_root_worker() -> Result<Self, WorkerError> {
-        let output = ["/usr/bin/id", "/bin/id"]
-            .into_iter()
-            .find_map(|program| std::process::Command::new(program).arg("-u").output().ok())
-            .ok_or_else(|| {
-                WorkerError::Platform("could not determine the worker user ID".to_owned())
-            })?;
-        if !output.status.success() || output.stdout != b"0\n" {
-            return Err(WorkerError::NotRoot);
+        if std::env::var_os("SNAPDOG_INSTALLER_ALLOW_UDISKS_WRITE").as_deref()
+            != Some(std::ffi::OsStr::new("YES-I-UNDERSTAND"))
+        {
+            return Err(WorkerError::RawDeviceDisabled);
         }
         Ok(Self { _private: () })
     }
@@ -313,7 +301,7 @@ pub fn run_macos_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashRe
 /// Run one raw-device job on Linux after native privilege elevation.
 #[cfg(target_os = "linux")]
 pub fn run_linux_worker(job: &WorkerJob, _gate: RawDeviceGate) -> Result<FlashReport, WorkerError> {
-    run_unix_worker(job, &mut linux::LinuxPlatform)
+    run_unix_worker(job, &mut linux::LinuxPlatform::default())
 }
 
 #[cfg(unix)]

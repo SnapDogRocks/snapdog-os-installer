@@ -103,6 +103,28 @@ command -v create-dmg >/dev/null 2>&1 || {
   echo "create-dmg is required (CI installs the pinned v1.2.2 source archive)" >&2
   exit 1
 }
+CREATE_DMG_HELP=$(create-dmg --help 2>&1 || true)
+for option in \
+  --volname \
+  --volicon \
+  --background \
+  --window-pos \
+  --window-size \
+  --text-size \
+  --icon-size \
+  --icon \
+  --hide-extension \
+  --app-drop-link \
+  --no-internet-enable
+do
+  case "$CREATE_DMG_HELP" in
+    *"$option"*) ;;
+    *)
+      echo "create-dmg does not support required option: $option" >&2
+      exit 1
+      ;;
+  esac
+done
 
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo build --locked --release --target aarch64-apple-darwin
@@ -168,7 +190,6 @@ create-dmg \
   --hide-extension "${APP_NAME}.app" \
   --app-drop-link 450 200 \
   --no-internet-enable \
-  --overwrite \
   "$UNVALIDATED_DMG" "$STAGING"
 codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" "$UNVALIDATED_DMG"
 

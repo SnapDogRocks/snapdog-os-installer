@@ -2,7 +2,7 @@
 name = "snapdog-os-installer"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 license = "GPL-3.0-only"
 repository = "https://github.com/SnapDogRocks/snapdog-os-installer"
 homepage = "https://snapdog.cc"
@@ -27,7 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-plist = "1"
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString", "CFURL"] }
+objc2-disk-arbitration = { version = "=0.3.2", default-features = false, features = ["std", "DADisk", "DADissenter", "DASession", "libc"] }
+objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc"] }
+objc2-security = { version = "=0.3.2", default-features = false, features = ["std", "CSCommon", "SecBase", "SecRequirement", "SecStaticCode"] }
 unix-ancillary = "0.2.2"
 wgpu = { version = "=27.0.1", default-features = false, features = ["metal"] }
 
@@ -51,6 +54,8 @@ windows-sys = { version = "=0.61.2", features = [
 wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+aligned-vec = "=0.6.4"
+zbus = { version = "=5.18.0", default-features = false, features = ["blocking-api"] }
 wgpu = { version = "=27.0.1", default-features = false, features = ["gles", "vulkan"] }
 
 [build-dependencies]

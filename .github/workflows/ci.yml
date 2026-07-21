@@ -14,7 +14,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.88.0
 
 jobs:
   conventional-commits:
@@ -57,9 +56,8 @@ jobs:
           libxrandr-dev pkg-config shellcheck
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
-          rustup default "$RUST_VERSION"
-          rustup component add clippy rustfmt
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Cache security tools
@@ -98,9 +96,8 @@ jobs:
       - name: Install Rust
         shell: bash
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
-          rustup default "$RUST_VERSION"
-          rustup component add clippy rustfmt
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run strict Windows checks

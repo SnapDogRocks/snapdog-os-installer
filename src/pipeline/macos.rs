@@ -707,21 +707,8 @@ fn bundle_for_executable(executable: &Path) -> Result<PathBuf, WorkerRunnerError
 
 #[cfg(not(debug_assertions))]
 fn verify_signed_bundle(bundle: &Path) -> Result<(), WorkerRunnerError> {
-    let output = Command::new("/usr/bin/codesign")
-        .arg("--verify")
-        .arg("--deep")
-        .arg("--strict")
-        .arg(format!("-R={WORKER_REQUIREMENT}"))
-        .arg(bundle)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(WorkerRunnerError::Failed {
-            status: output.status.to_string(),
-            message: stderr_message(&output.stderr),
-        })
-    }
+    crate::macos_native::verify_code_signature(bundle, WORKER_REQUIREMENT)
+        .map_err(WorkerRunnerError::Io)
 }
 
 #[cfg(test)]
@@ -788,20 +775,14 @@ mod tests {
     }
 
     #[test]
-    fn codesign_requirement_flag_rejects_a_false_designated_requirement() {
-        let status = Command::new("/usr/bin/codesign")
-            .args([
-                "--verify",
-                "--strict",
-                r#"-R=identifier "cc.snapdog.this-is-deliberately-false""#,
-                "/bin/ls",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-
-        assert!(!status.success());
+    fn native_signature_check_rejects_a_false_designated_requirement() {
+        assert!(
+            crate::macos_native::verify_code_signature(
+                Path::new("/bin/ls"),
+                r#"identifier "cc.snapdog.this-is-deliberately-false""#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
