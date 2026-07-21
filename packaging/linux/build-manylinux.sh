@@ -69,12 +69,11 @@ if ! command -v rustup >/dev/null 2>&1; then
     --output "$RUSTUP_INIT"
   printf '%s  %s\n' "$RUSTUP_SHA256" "$RUSTUP_INIT" | sha256sum --check --status
   chmod 0755 "$RUSTUP_INIT"
-  "$RUSTUP_INIT" -y --profile minimal --default-toolchain 1.88.0
+  "$RUSTUP_INIT" -y --profile minimal --default-toolchain none
 fi
 
-rustup toolchain install 1.88.0 --profile minimal --no-self-update \
-  --component clippy --component rustfmt
-rustup default 1.88.0
+rustup toolchain install --no-self-update
+rustup show active-toolchain
 
 BUILD_UID=${HOST_UID:-1000}
 BUILD_GID=${HOST_GID:-1000}

@@ -15,7 +15,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.88.0
 
 jobs:
   validate-tag:
@@ -66,9 +65,8 @@ jobs:
           libxrandr-dev pkg-config shellcheck
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
-          rustup default "$RUST_VERSION"
-          rustup component add clippy rustfmt
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -170,10 +168,9 @@ jobs:
       - name: Install Rust target
         shell: pwsh
         run: |
-          rustup toolchain install $env:RUST_VERSION --profile minimal --no-self-update
-          rustup default $env:RUST_VERSION
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
           rustup target add '${{ matrix.target }}'
-          rustup component add clippy rustfmt
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -274,9 +271,8 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust
         run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
-          rustup default "$RUST_VERSION"
-          rustup component add clippy rustfmt
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:

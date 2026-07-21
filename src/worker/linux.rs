@@ -8,15 +8,19 @@
 //! from that validated kernel name and are passed as individual arguments, never through a shell.
 
 use std::collections::BTreeSet;
-use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
-use super::{WorkerDrive, WorkerError, WorkerPlatform, compare_drive};
+use aligned_vec::{AVec, RuntimeAlign};
+use zbus::blocking::{Connection, Proxy};
+use zbus::zvariant::{OwnedFd, OwnedObjectPath, Value};
+
+use super::{WorkerDrive, WorkerError, WorkerPlatform, WorkerTarget, compare_drive};
 use crate::flash::FlashError;
 
 const SYS_BLOCK: &str = "/sys/block";
@@ -26,32 +30,93 @@ const PROC_SWAPS: &str = "/proc/swaps";
 const DEV_ROOT: &str = "/dev";
 const KERNEL_SECTOR_SIZE: u64 = 512;
 
-// Linux UAPI values. `O_NOFOLLOW` prevents a final-component symlink and `O_EXCL` makes opening a
-// mounted block device fail with EBUSY. Rust's standard library already adds O_CLOEXEC.
+// Linux UAPI values accepted by UDisks2 Block.OpenDevice. O_EXCL rejects mounted media, O_SYNC
+// gives completed writes, and O_DIRECT makes verification bypass the block-device page cache.
 const O_EXCL: i32 = 0o200;
-const O_NOFOLLOW: i32 = 0o400_000;
+const O_DIRECT: i32 = 0o40_000;
+const O_SYNC: i32 = 0o4_010_000;
+const DIRECT_ALIGNMENT: usize = 4096;
+const VERIFICATION_BUFFER_SIZE: usize = 1024 * 1024;
+const UDISKS_SERVICE: &str = "org.freedesktop.UDisks2";
+const UDISKS_MANAGER_PATH: &str = "/org/freedesktop/UDisks2/Manager";
+const UDISKS_MANAGER_INTERFACE: &str = "org.freedesktop.UDisks2.Manager";
+const UDISKS_BLOCK_INTERFACE: &str = "org.freedesktop.UDisks2.Block";
+const UDISKS_FILESYSTEM_INTERFACE: &str = "org.freedesktop.UDisks2.Filesystem";
+const UDISKS_DRIVE_INTERFACE: &str = "org.freedesktop.UDisks2.Drive";
 
-const UMOUNT_COMMANDS: &[&str] = &["/usr/bin/umount", "/bin/umount"];
-const BLOCKDEV_COMMANDS: &[&str] = &["/usr/sbin/blockdev", "/sbin/blockdev"];
-const UDISKSCTL_COMMANDS: &[&str] = &["/usr/bin/udisksctl", "/bin/udisksctl"];
-const EJECT_COMMANDS: &[&str] = &["/usr/bin/eject", "/bin/eject"];
+#[derive(Default)]
+pub(super) struct LinuxPlatform {
+    connection: Option<Connection>,
+}
 
-pub(super) struct LinuxPlatform;
+pub(super) struct LinuxTarget {
+    writer: Option<File>,
+    verifier: Option<DirectVerifier>,
+}
+
+impl Read for LinuxTarget {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if let Some(verifier) = self.verifier.as_mut() {
+            verifier.read(output)
+        } else {
+            self.writer
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Linux target is unavailable"))?
+                .read(output)
+        }
+    }
+}
+
+impl Write for LinuxTarget {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Linux write handle is unavailable"))?
+            .write(input)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Linux write handle is unavailable"))?
+            .flush()
+    }
+}
+
+impl Seek for LinuxTarget {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.verifier.as_mut().map_or_else(
+            || {
+                self.writer
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("Linux target is unavailable"))?
+                    .seek(position)
+            },
+            |verifier| verifier.seek(position),
+        )
+    }
+}
+
+impl super::WorkerTarget for LinuxTarget {
+    fn sync_all(&self) -> io::Result<()> {
+        self.writer.as_ref().map_or(Ok(()), File::sync_all)
+    }
+}
 
 impl WorkerPlatform for LinuxPlatform {
-    type Target = File;
+    type Target = LinuxTarget;
 
     fn validate_staged_image(&mut self, image: &File) -> Result<(), WorkerError> {
         let metadata = image
             .metadata()
             .map_err(|error| WorkerError::Platform(error.to_string()))?;
         if !metadata.is_file()
-            || metadata.uid() != 0
+            || metadata.uid() == 0
             || metadata.mode() & 0o077 != 0
             || metadata.nlink() > 1
         {
             return Err(WorkerError::InvalidJob(
-                "staged image is not an unlinked, root-owned private file".to_owned(),
+                "staged image is not an unlinked private file owned by the desktop user".to_owned(),
             ));
         }
         Ok(())
@@ -80,13 +145,25 @@ impl WorkerPlatform for LinuxPlatform {
         compare_drive(selected, &self.validate_target(selected)?)?;
         let mountinfo = fs::read_to_string(PROC_MOUNTINFO)
             .map_err(|error| WorkerError::Platform(error.to_string()))?;
-        let mut mount_points = mounted_paths(&mountinfo, &device_numbers)?;
-        sort_mount_points_for_unmount(&mut mount_points);
-
-        for mount_point in mount_points {
+        let mut mounts = parse_mountinfo(&mountinfo)?
+            .into_iter()
+            .filter(|mount| device_numbers.contains(&mount.device))
+            .collect::<Vec<_>>();
+        mounts.sort_by(|left, right| {
+            right
+                .path
+                .components()
+                .count()
+                .cmp(&left.path.components().count())
+        });
+        let mut unmounted = BTreeSet::new();
+        for mount in mounts {
+            if !unmounted.insert(mount.device) {
+                continue;
+            }
             compare_drive(selected, &self.validate_target(selected)?)?;
-            let arguments = [OsStr::new("--"), mount_point.as_os_str()];
-            run_checked(UMOUNT_COMMANDS, &arguments)?;
+            let path = self.block_object(mount.device)?;
+            self.call_no_result(&path, UDISKS_FILESYSTEM_INTERFACE, "Unmount")?;
         }
 
         compare_drive(selected, &self.validate_target(selected)?)?;
@@ -103,20 +180,14 @@ impl WorkerPlatform for LinuxPlatform {
     fn open_target(
         &mut self,
         selected: &WorkerDrive,
-        verify: bool,
+        _verify: bool,
     ) -> Result<Self::Target, WorkerError> {
         compare_drive(selected, &self.validate_target(selected)?)?;
         let (block_name, _) = split_stable_identifier(&selected.id)?;
-        let device_path = Path::new(DEV_ROOT).join(block_name);
         let expected_device =
             read_device_number(&Path::new(SYS_BLOCK).join(block_name).join("dev"))?;
 
-        let target = OpenOptions::new()
-            .read(verify)
-            .write(true)
-            .custom_flags(O_NOFOLLOW | O_EXCL)
-            .open(&device_path)
-            .map_err(|error| WorkerError::Platform(error.to_string()))?;
+        let target = self.open_device(expected_device, "rw", O_EXCL | O_SYNC)?;
 
         validate_opened_device(&target, expected_device)?;
         // Detect a device replacement in the interval between the sysfs lookup and raw open.
@@ -127,7 +198,10 @@ impl WorkerPlatform for LinuxPlatform {
             return Err(WorkerError::TargetChanged);
         }
         validate_opened_device(&target, current_device)?;
-        Ok(target)
+        Ok(LinuxTarget {
+            writer: Some(target),
+            verifier: None,
+        })
     }
 
     fn prepare_verification(
@@ -137,16 +211,22 @@ impl WorkerPlatform for LinuxPlatform {
     ) -> Result<(), FlashError> {
         let map_error = |error: WorkerError| FlashError::Io(io::Error::other(error.to_string()));
 
-        // `File::sync_all` submits all dirty pages and a device cache flush. BLKFLSBUF then drops
-        // the Linux block-device buffer cache, ensuring the following seek/read cannot simply
-        // hash the pages that were populated by this process' writes.
+        // Finish synchronous writes, close that descriptor, then ask UDisks2 for a fresh O_DIRECT
+        // descriptor. The aligned verifier therefore reads the physical device rather than pages
+        // populated by this process' writes.
         let current = self.validate_target(selected).map_err(map_error)?;
         compare_drive(selected, &current).map_err(map_error)?;
         target.sync_all().map_err(FlashError::from)?;
         let (block_name, _) = split_stable_identifier(&selected.id).map_err(map_error)?;
-        let device_path = Path::new(DEV_ROOT).join(block_name);
-        let arguments = [OsStr::new("--flushbufs"), device_path.as_os_str()];
-        run_checked(BLOCKDEV_COMMANDS, &arguments).map_err(map_error)?;
+        drop(target.writer.take());
+        let expected_device =
+            read_device_number(&Path::new(SYS_BLOCK).join(block_name).join("dev"))
+                .map_err(map_error)?;
+        let direct = self
+            .open_device(expected_device, "r", O_EXCL | O_DIRECT)
+            .map_err(map_error)?;
+        target.verifier =
+            Some(DirectVerifier::new(direct, selected.capacity).map_err(FlashError::from)?);
         let current = self.validate_target(selected).map_err(map_error)?;
         compare_drive(selected, &current).map_err(map_error)
     }
@@ -158,40 +238,204 @@ impl WorkerPlatform for LinuxPlatform {
         self.unmount(selected)?;
         compare_drive(selected, &self.validate_target(selected)?)?;
         let (block_name, _) = split_stable_identifier(&selected.id)?;
-        let device_path = Path::new(DEV_ROOT).join(block_name);
-
-        let udisks_arguments = [
-            OsStr::new("power-off"),
-            OsStr::new("--block-device"),
-            device_path.as_os_str(),
-            OsStr::new("--no-user-interaction"),
-        ];
-        let mut failures = Vec::new();
-        match run_if_available(UDISKSCTL_COMMANDS, &udisks_arguments) {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(error) => failures.push(error.to_string()),
+        let expected_device =
+            read_device_number(&Path::new(SYS_BLOCK).join(block_name).join("dev"))?;
+        let block_path = self.block_object(expected_device)?;
+        let drive: OwnedObjectPath = self
+            .proxy(&block_path, UDISKS_BLOCK_INTERFACE)?
+            .get_property("Drive")
+            .map_err(udisks_error)?;
+        match self.call_no_result(&drive, UDISKS_DRIVE_INTERFACE, "PowerOff") {
+            Ok(()) => Ok(()),
+            Err(power_error) => self
+                .call_no_result(&drive, UDISKS_DRIVE_INTERFACE, "Eject")
+                .map_err(|eject_error| {
+                    WorkerError::Platform(format!(
+                        "UDisks2 could neither power off nor eject the target: {power_error}; {eject_error}"
+                    ))
+                }),
         }
+    }
+}
 
-        let eject_arguments = [OsStr::new("--"), device_path.as_os_str()];
-        match run_if_available(EJECT_COMMANDS, &eject_arguments) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => {
-                tracing::warn!(
-                    failures = ?failures,
-                    "target is synced and unmounted, but no power-off helper is available"
-                );
-                Ok(())
-            }
-            Err(error) => {
-                failures.push(error.to_string());
-                tracing::warn!(
-                    failures = ?failures,
-                    "target is synced and unmounted, but automatic power-off failed"
-                );
-                Ok(())
+impl LinuxPlatform {
+    fn connection(&mut self) -> Result<Connection, WorkerError> {
+        if self.connection.is_none() {
+            self.connection = Some(Connection::system().map_err(udisks_error)?);
+        }
+        Ok(self
+            .connection
+            .as_ref()
+            .expect("connection initialized")
+            .clone())
+    }
+
+    fn proxy(
+        &mut self,
+        path: &OwnedObjectPath,
+        interface: &str,
+    ) -> Result<Proxy<'static>, WorkerError> {
+        Proxy::new_owned(
+            self.connection()?,
+            UDISKS_SERVICE.to_owned(),
+            path.clone(),
+            interface.to_owned(),
+        )
+        .map_err(udisks_error)
+    }
+
+    fn block_paths(&mut self) -> Result<Vec<OwnedObjectPath>, WorkerError> {
+        let manager = Proxy::new_owned(
+            self.connection()?,
+            UDISKS_SERVICE.to_owned(),
+            UDISKS_MANAGER_PATH.to_owned(),
+            UDISKS_MANAGER_INTERFACE.to_owned(),
+        )
+        .map_err(udisks_error)?;
+        let options = HashMap::<&str, Value<'_>>::new();
+        manager
+            .call("GetBlockDevices", &(options,))
+            .map_err(udisks_error)
+    }
+
+    fn block_object(&mut self, expected: DeviceNumber) -> Result<OwnedObjectPath, WorkerError> {
+        for path in self.block_paths()? {
+            let device_number: u64 = self
+                .proxy(&path, UDISKS_BLOCK_INTERFACE)?
+                .get_property("DeviceNumber")
+                .map_err(udisks_error)?;
+            if decode_linux_device(device_number) == expected {
+                return Ok(path);
             }
         }
+        Err(WorkerError::TargetMissing)
+    }
+
+    fn open_device(
+        &mut self,
+        expected: DeviceNumber,
+        mode: &str,
+        flags: i32,
+    ) -> Result<File, WorkerError> {
+        let path = self.block_object(expected)?;
+        let mut options = HashMap::new();
+        options.insert("flags", Value::from(flags));
+        let fd: OwnedFd = self
+            .proxy(&path, UDISKS_BLOCK_INTERFACE)?
+            .call("OpenDevice", &(mode, options))
+            .map_err(udisks_error)?;
+        let file = File::from(std::os::fd::OwnedFd::from(fd));
+        validate_opened_device(&file, expected)?;
+        Ok(file)
+    }
+
+    fn call_no_result(
+        &mut self,
+        path: &OwnedObjectPath,
+        interface: &str,
+        method: &str,
+    ) -> Result<(), WorkerError> {
+        let options = HashMap::<&str, Value<'_>>::new();
+        self.proxy(path, interface)?
+            .call(method, &(options,))
+            .map_err(udisks_error)
+    }
+}
+
+fn udisks_error(error: zbus::Error) -> WorkerError {
+    let message = error.to_string();
+    drop(error);
+    WorkerError::Platform(format!("UDisks2 operation failed: {message}"))
+}
+
+#[derive(Debug)]
+struct DirectVerifier {
+    file: File,
+    position: u64,
+    capacity: u64,
+    buffer: AVec<u8, RuntimeAlign>,
+}
+
+impl DirectVerifier {
+    fn new(file: File, capacity: u64) -> io::Result<Self> {
+        if capacity == 0 || !capacity.is_multiple_of(KERNEL_SECTOR_SIZE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported Linux block-device geometry",
+            ));
+        }
+        let mut buffer = AVec::<u8, RuntimeAlign>::with_capacity(
+            DIRECT_ALIGNMENT,
+            VERIFICATION_BUFFER_SIZE + DIRECT_ALIGNMENT,
+        );
+        buffer.resize(VERIFICATION_BUFFER_SIZE + DIRECT_ALIGNMENT, 0);
+        Ok(Self {
+            file,
+            position: 0,
+            capacity,
+            buffer,
+        })
+    }
+
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.position >= self.capacity {
+            return Ok(0);
+        }
+        let requested = output.len().min(VERIFICATION_BUFFER_SIZE);
+        let requested_u64 = u64::try_from(requested)
+            .map_err(|_| io::Error::other("verification read size does not fit u64"))?;
+        let available = usize::try_from((self.capacity - self.position).min(requested_u64))
+            .map_err(|_| io::Error::other("verification read size does not fit usize"))?;
+        let aligned_start = self.position - (self.position % KERNEL_SECTOR_SIZE);
+        let prefix = usize::try_from(self.position - aligned_start)
+            .map_err(|_| io::Error::other("verification prefix does not fit usize"))?;
+        let needed = prefix
+            .checked_add(available)
+            .ok_or_else(|| io::Error::other("verification transfer length overflow"))?;
+        let sector_size = usize::try_from(KERNEL_SECTOR_SIZE).expect("sector size fits usize");
+        let aligned_length = needed
+            .div_ceil(sector_size)
+            .checked_mul(sector_size)
+            .ok_or_else(|| io::Error::other("verification transfer length overflow"))?;
+        if aligned_length > self.buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unaligned Linux verification request",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(aligned_start))?;
+        let count = self.file.read(&mut self.buffer[..aligned_length])?;
+        if count == 0 {
+            return Ok(0);
+        }
+        if !count.is_multiple_of(sector_size) || count <= prefix {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Linux returned an incomplete direct disk sector",
+            ));
+        }
+        let copied = available.min(count - prefix);
+        output[..copied].copy_from_slice(&self.buffer[prefix..prefix + copied]);
+        self.position += u64::try_from(copied)
+            .map_err(|_| io::Error::other("verification result length does not fit u64"))?;
+        Ok(copied)
+    }
+
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.capacity) + i128::from(offset),
+        };
+        if next < 0 || next > i128::from(self.capacity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux verification seek is outside the physical disk",
+            ));
+        }
+        self.position = u64::try_from(next)
+            .map_err(|_| io::Error::other("verification position does not fit u64"))?;
+        Ok(self.position)
     }
 }
 
@@ -416,6 +660,7 @@ fn mounted_paths(
         .collect())
 }
 
+#[cfg(test)]
 fn sort_mount_points_for_unmount(paths: &mut Vec<PathBuf>) {
     paths.sort_by(|left, right| {
         right
@@ -541,41 +786,6 @@ const fn decode_linux_device(device: u64) -> DeviceNumber {
     DeviceNumber {
         major: ((device >> 8) & 0x0fff) | ((device >> 32) & 0xffff_f000),
         minor: (device & 0x00ff) | ((device >> 12) & 0xffff_ff00),
-    }
-}
-
-fn run_checked(commands: &[&str], arguments: &[&OsStr]) -> Result<Output, WorkerError> {
-    run_if_available(commands, arguments)?.map_or_else(
-        || {
-            Err(WorkerError::Platform(format!(
-                "required command is unavailable ({})",
-                commands.join(" or ")
-            )))
-        },
-        Ok,
-    )
-}
-
-fn run_if_available(
-    commands: &[&str],
-    arguments: &[&OsStr],
-) -> Result<Option<Output>, WorkerError> {
-    let Some(command) = commands.iter().map(Path::new).find(|path| path.is_file()) else {
-        return Ok(None);
-    };
-    let output = Command::new(command)
-        .args(arguments)
-        .output()
-        .map_err(|error| WorkerError::Platform(error.to_string()))?;
-    if output.status.success() {
-        Ok(Some(output))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(WorkerError::Platform(if stderr.is_empty() {
-            format!("{} failed with status {}", command.display(), output.status)
-        } else {
-            format!("{}: {stderr}", command.display())
-        }))
     }
 }
 

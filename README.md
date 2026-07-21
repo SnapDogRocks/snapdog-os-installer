@@ -35,14 +35,21 @@ identity prevents a remove/reinsert race from redirecting a queued job.
 
 - macOS verifies the signed application bundle, runs its worker without root privileges, and uses
   Apple's `authopen` to grant access only to the selected raw-device descriptor. Target discovery
-  and identity validation use `diskutil` and the I/O Registry.
-- Linux uses PolicyKit, kernel `diskseq`, sysfs device identity, and mount/swap/holder protection.
-  Linux kernel 5.15 or newer is required so path reuse can be detected without an unsafe fallback.
+  and identity validation use IOKit and Disk Arbitration directly; unmount, eject, and signature
+  validation likewise use native frameworks rather than command-line tools.
+- Linux runs the same executable without root and uses UDisks2's system D-Bus API for scoped
+  PolicyKit authorization, unmounting, raw-device descriptors, and power-off/eject. Kernel
+  `diskseq`, sysfs device identity, and mount/swap/holder protection remain in-process. Linux
+  kernel 5.15 or newer and UDisks2 2.7.3 or newer are required.
 - Windows uses native COM/WMI and Win32 storage APIs plus UAC, requires positive SD/MMC or
   removable USB identity, and verifies through sector-aligned unbuffered reads after an exclusive
   write-through physical-disk write. Boot, system, read-only, fixed, and ambiguous USB disks are
   rejected. No command shell participates in discovery, authorization, dismount, writing, or
   verification.
+
+The installed artifact remains one executable on every platform. macOS relies only on OS frameworks
+plus the system `authopen` privilege broker; Linux relies on the UDisks2/PolicyKit system services,
+not on command-line programs or a bundled helper.
 
 The automated tests use ordinary temporary files and never open a real device. See
 [Architecture and safety model](docs/architecture.md) for the complete boundary and failure model,
@@ -51,7 +58,8 @@ release checklist.
 
 ## Development
 
-Rust 1.88 or newer is required.
+Rust 1.97 is required. The repository pins the exact supported compiler and components in
+`rust-toolchain.toml`, which `rustup` selects automatically.
 
 ```bash
 cargo run
@@ -59,7 +67,7 @@ cargo run
 ```
 
 `scripts/check.sh` enforces formatting, all/pedantic/nursery Clippy lints, warnings-as-errors,
-tests, the Rust 1.88 minimum version, and mandatory license, advisory, and dependency auditing.
+tests, the pinned Rust toolchain, and mandatory license, advisory, and dependency auditing.
 
 Platform packages are produced with:
 

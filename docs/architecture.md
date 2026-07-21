@@ -3,8 +3,9 @@
 SnapDog OS Installer is one Rust executable with two runtime modes:
 
 1. The unprivileged `egui` application selects one OS image and exactly one removable target.
-2. The same executable re-enters through the native administrator flow to perform the minimum
-   privileged operations required to unmount, write, verify, sync, and eject that target.
+2. The same executable re-enters as an isolated worker. macOS passes it one descriptor authorized
+   by `authopen`, Linux obtains scoped descriptors and operations from UDisks2, and Windows uses
+   UAC for the minimum raw-device operations.
 
 There is no separately shipped sidecar. macOS, Linux, and Windows all use the same serialized job
 and JSON-lines progress protocol, while target discovery, elevation, and raw-device handling remain
@@ -18,7 +19,7 @@ small platform modules.
 - The compressed size and SHA-256 are checked while streaming to a private temporary file.
 - The archive is decompressed with a bounded buffer; raw size and SHA-256 are checked before
   administrator authorization is requested.
-- The privileged worker treats every serialized path as untrusted. It copies the prepared raw image
+- The isolated worker treats every serialized path as untrusted. It copies the prepared raw image
   into an unlinked staging file and hashes it again before enumerating the target.
 - The target must be large enough before elevation. Written bytes are verified by default; an
   explicit skip produces a visible **Not verified** result.
@@ -45,12 +46,15 @@ Common invariants:
 
 Platform identity:
 
-- **macOS:** `diskutil list -plist physical` is intersected with I/O Registry media marked exactly
-  whole, writable, removable, and ejectable. The whole-media `IORegistryEntryID` survives the
-  privilege boundary and detects device-path reuse, including Apple's built-in SDXC reader.
+- **macOS:** IOKit media marked exactly whole, writable, removable, ejectable, and physically
+  backed are cross-checked against Disk Arbitration. File-backed HDI ancestry is rejected. The
+  whole-media `IORegistryEntryID` survives the privilege boundary and detects device-path reuse,
+  including Apple's built-in SDXC reader.
 - **Linux:** `/sys/block` must report a writable removable whole block device with a positive kernel
   `diskseq`. Device numbers, partitions, transitive holders, protected mounts, and swap are checked;
-  the opened block descriptor is revalidated against sysfs before writing.
+  UDisks2 returns the PolicyKit-authorized raw descriptor, which is revalidated against sysfs before
+  writing. Synchronous writes are followed by a newly authorized, aligned `O_DIRECT` descriptor for
+  cache-bypassing verification.
 - **Windows:** the Storage Management WMI provider must report a writable, online SD/MMC device, or
   a USB device whose `Win32_DiskDrive` capabilities positively identify removable media. Ordinary
   USB HDDs and SSDs are excluded even when externally attached. A fingerprint binds disk number,
@@ -64,32 +68,30 @@ Platform identity:
 
 ## Privilege boundary
 
-- Raw-device mode requires an exact, digest-bound worker CLI. The worker additionally proves root
-  or Administrator identity. macOS uses a launcher-only environment opt-in; Windows uses a fixed
-  CLI opt-in; Linux deliberately transports neither arbitrary environment nor a generic helper
-  command through PolicyKit.
+- Raw-device mode requires an exact, digest-bound worker CLI. Windows additionally proves
+  Administrator identity. macOS and Linux use launcher-only accidental-write opt-ins, while the
+  operating system independently authorizes the exact raw-device descriptor or operation.
 - Job, raw image, progress, cancel, and verification-skip paths are fixed-name members of one
   private session directory.
 - Unix validates directory owner, mode, parent identity, link count, file type, size, and stable
-  device/inode identity. Linux also permits only the root-owned sticky `/tmp` parent shape.
+  device/inode identity. Linux also permits the standard root-owned sticky `/tmp` parent shape.
 - Windows rejects reparse points and pins the session directory and opened files with native file
   identity handles across the UAC hand-off.
 - Progress records and helper diagnostics are size-bounded. Monitoring failures create a durable
   cancel marker and wait for the worker so temporary state cannot disappear under a privileged
   process.
-- macOS copies the signed application into a root-owned directory, verifies its Developer ID
-  designated requirement, and binds the worker job to a SHA-256 digest across the administrator
-  prompt. Linux invokes a constant program through a validated, root-owned `pkexec`/`bash` toolchain;
-  that program copies the pre-hashed executable into a private root-owned directory, verifies the
-  copy, and passes the digest-bound job to it. Windows invokes UAC directly through
-  `ShellExecuteExW`, with a constant executable and separately quoted native arguments. Discovery,
-  elevation, volume locking, dismount, writing, and verification never invoke a command shell.
+- macOS validates its Developer ID requirement with Security.framework, binds the job to a SHA-256
+  digest, and uses the system `authopen` broker to return only the selected raw descriptor. Linux
+  directly re-enters the pinned executable with a digest-bound job; UDisks2 then performs PolicyKit
+  checks for `OpenDevice`, `Unmount`, and `PowerOff`/`Eject` over the system D-Bus. Windows invokes
+  UAC directly through `ShellExecuteExW`, with a constant executable and separately quoted native
+  arguments. No platform invokes a command shell at runtime.
 
 ## Tests and release gates
 
 Unit and integration tests write only to ordinary files. Platform worker modules additionally test
-identity parsing, hotplug/path-reuse rejection, progress framing, and command argument construction.
-A release requires strict Clippy, tests on Linux/macOS/Windows, Rust 1.88 compatibility, dependency
+identity parsing, hotplug/path-reuse rejection, progress framing, and native API request handling.
+A release requires strict Clippy, tests on Linux/macOS/Windows, the pinned Rust toolchain, dependency
 audit, native ARM64/x86-64 package builds, a notarized universal DMG, the exact five-asset set,
 checksums, and build-provenance attestations.
 

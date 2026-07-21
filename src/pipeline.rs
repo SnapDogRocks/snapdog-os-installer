@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Unprivileged image preparation and privileged worker orchestration.
+//! Unprivileged image preparation and isolated same-executable writer orchestration.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -34,7 +34,7 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsWorkerRunner;
 
-/// Command-line switch used to re-enter this executable as the privileged worker.
+/// Command-line switch used to re-enter this executable as the isolated writer.
 pub const WORKER_JOB_ARGUMENT: &str = "--worker-job";
 
 /// Everything required to download, prepare, and flash one image.
@@ -92,19 +92,19 @@ pub enum PipelineError {
     Preparation(#[from] FlashError),
     #[error(transparent)]
     Control(#[from] PipelineControlError),
-    #[error("could not serialize the privileged worker job: {0}")]
+    #[error("could not serialize the isolated writer job: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("pipeline file operation failed: {0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
     Runner(#[from] WorkerRunnerError),
-    #[error("the privileged worker failed: {0}")]
+    #[error("the isolated writer failed: {0}")]
     WorkerFailed(String),
-    #[error("the privileged worker exited without a terminal progress event")]
+    #[error("the isolated writer exited without a terminal progress event")]
     MissingTerminalEvent,
 }
 
-/// Failures while launching or monitoring a privileged worker.
+/// Failures while launching or monitoring the isolated same-executable writer.
 #[derive(Debug, Error)]
 pub enum WorkerRunnerError {
     #[error("administrator authorization was cancelled or denied")]
@@ -115,7 +115,7 @@ pub enum WorkerRunnerError {
     InvalidProgress(String),
     #[error("worker process failed with status {status}: {message}")]
     Failed { status: String, message: String },
-    #[error("a privileged worker runner is not implemented on this platform")]
+    #[error("an isolated writer runner is not implemented on this platform")]
     Unsupported,
 }
 

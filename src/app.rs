@@ -448,7 +448,7 @@ impl SnapDogInstallerApp {
                 ui.add_enabled_ui(self.board.is_some(), |ui| {
                     egui::Frame::new()
                         .fill(ELEVATED)
-                        .stroke(Stroke::new(1.0, Color32::from_gray(76)))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_gray(76)))
                         .corner_radius(18.0)
                         .inner_margin(egui::Margin::same(2))
                         .show(ui, |ui| {
@@ -508,8 +508,8 @@ impl SnapDogInstallerApp {
                     ] {
                         visuals.bg_fill = Color32::from_rgb(245, 243, 241);
                         visuals.weak_bg_fill = Color32::from_rgb(245, 243, 241);
-                        visuals.fg_stroke = Stroke::new(1.0, Color32::BLACK);
-                        visuals.bg_stroke = Stroke::new(1.0, Color32::from_gray(198));
+                        visuals.fg_stroke = Stroke::new(1.0_f32, Color32::BLACK);
+                        visuals.bg_stroke = Stroke::new(1.0_f32, Color32::from_gray(198));
                         visuals.corner_radius = 10.0.into();
                     }
                     egui::ComboBox::from_id_salt("release-version")
@@ -564,7 +564,7 @@ impl SnapDogInstallerApp {
                 let mut refresh = false;
                 egui::Frame::new()
                     .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(114, 76, 40)))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(114, 76, 40)))
                     .corner_radius(12.0)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -580,7 +580,7 @@ impl SnapDogInstallerApp {
                                 let button =
                                     egui::Button::new(RichText::new("Retry").color(TEXT).strong())
                                         .fill(ELEVATED)
-                                        .stroke(Stroke::new(1.0, ORANGE))
+                                        .stroke(Stroke::new(1.0_f32, ORANGE))
                                         .corner_radius(8.0)
                                         .min_size(Vec2::new(68.0, 28.0));
                                 refresh = ui.add(button).clicked();
@@ -920,7 +920,7 @@ impl SnapDogInstallerApp {
                                 egui::Button::new(RichText::new(text).color(TEXT).strong())
                                     .fill(if selected { ELEVATED } else { SURFACE })
                                     .stroke(Stroke::new(
-                                        if selected { 2.0 } else { 1.0 },
+                                        if selected { 2.0_f32 } else { 1.0_f32 },
                                         if selected {
                                             ORANGE
                                         } else {
@@ -1356,7 +1356,7 @@ fn paint_apple_switch(ui: &egui::Ui, rect: egui::Rect, response: &egui::Response
         track,
         12.0,
         Stroke::new(
-            1.0,
+            1.0_f32,
             if selected {
                 Color32::from_rgb(242, 154, 65)
             } else {
@@ -1379,7 +1379,7 @@ fn paint_apple_switch(ui: &egui::Ui, rect: egui::Rect, response: &egui::Response
         ui.painter().rect_stroke(
             track.expand(3.0),
             15.0,
-            Stroke::new(2.0, BRIGHT_ORANGE),
+            Stroke::new(2.0_f32, BRIGHT_ORANGE),
             egui::StrokeKind::Outside,
         );
     }
@@ -1646,7 +1646,7 @@ fn failure_screen(ui: &mut egui::Ui, failure: &FailureState) -> ScreenAction {
         ui.add_space(16.0);
         egui::Frame::new()
             .fill(SURFACE)
-            .stroke(Stroke::new(1.0, Color32::from_gray(60)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_gray(60)))
             .corner_radius(14.0)
             .inner_margin(egui::Margin::symmetric(20, 12))
             .show(ui, |ui| {
@@ -1655,7 +1655,7 @@ fn failure_screen(ui: &mut egui::Ui, failure: &FailureState) -> ScreenAction {
                     if failure.failure.authorization_denied {
                         "Authorization cancelled"
                     } else {
-                        "Starting secure helper"
+                        "Starting secure writer"
                     }
                 } else {
                     failure.phase.title().trim_end_matches('…')
@@ -1740,7 +1740,7 @@ fn failure_copy(
             "Approve the system prompt so the installer can write to the selected SD card.",
         ),
         OperationPhase::Authorizing => (
-            "Couldn’t start the secure helper",
+            "Couldn’t start the secure writer",
             "The protected writing process could not start. No data was written to the SD card.",
         ),
         OperationPhase::ValidatingTarget | OperationPhase::Unmounting => (
@@ -1771,21 +1771,21 @@ fn operation_failure(error: &PipelineError) -> OperationFailure {
 fn failure_icon(ui: &mut egui::Ui, color: Color32, cancelled: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(50.0), egui::Sense::hover());
     let painter = ui.painter();
-    painter.circle_stroke(rect.center(), 22.0, Stroke::new(2.5, color));
+    painter.circle_stroke(rect.center(), 22.0, Stroke::new(2.5_f32, color));
     if cancelled {
         painter.line_segment(
             [
                 rect.center() + Vec2::new(-7.0, -7.0),
                 rect.center() + Vec2::new(7.0, 7.0),
             ],
-            Stroke::new(2.8, color),
+            Stroke::new(2.8_f32, color),
         );
         painter.line_segment(
             [
                 rect.center() + Vec2::new(7.0, -7.0),
                 rect.center() + Vec2::new(-7.0, 7.0),
             ],
-            Stroke::new(2.8, color),
+            Stroke::new(2.8_f32, color),
         );
     } else {
         painter.line_segment(
@@ -1793,7 +1793,7 @@ fn failure_icon(ui: &mut egui::Ui, color: Color32, cancelled: bool) {
                 rect.center() + Vec2::new(0.0, -10.0),
                 rect.center() + Vec2::new(0.0, 5.0),
             ],
-            Stroke::new(3.0, color),
+            Stroke::new(3.0_f32, color),
         );
         painter.circle_filled(rect.center() + Vec2::new(0.0, 12.0), 2.0, color);
     }
@@ -1858,7 +1858,7 @@ fn apply_pipeline_event(running: &mut RunningOperation, event: PipelineEvent) {
                     processed = ?progress.bytes_processed,
                     total = ?progress.total_bytes,
                     message = progress.message.as_deref().unwrap_or(""),
-                    "received privileged worker progress"
+                    "received isolated writer progress"
                 );
             }
             apply_worker_progress(running, &progress);
@@ -1994,7 +1994,7 @@ fn configure_style(context: &egui::Context) {
     style.visuals.selection.bg_fill = ORANGE;
     style.visuals.widgets.active.bg_fill = ORANGE;
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(240, 154, 63);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
     context.set_style(style);
 }
@@ -2028,13 +2028,17 @@ fn connector(ui: &mut egui::Ui, enabled: bool, height: f32) {
                     rect.left_center(),
                     rect.right_center() - Vec2::new(8.0, 0.0),
                 ],
-                Stroke::new(1.5, color),
+                Stroke::new(1.5_f32, color),
             );
             let tip = rect.right_center();
-            ui.painter()
-                .line_segment([tip - Vec2::new(8.0, 5.0), tip], Stroke::new(1.5, color));
-            ui.painter()
-                .line_segment([tip, tip - Vec2::new(8.0, -5.0)], Stroke::new(1.5, color));
+            ui.painter().line_segment(
+                [tip - Vec2::new(8.0, 5.0), tip],
+                Stroke::new(1.5_f32, color),
+            );
+            ui.painter().line_segment(
+                [tip, tip - Vec2::new(8.0, -5.0)],
+                Stroke::new(1.5_f32, color),
+            );
         },
     );
 }
@@ -2056,7 +2060,7 @@ fn board_button(ui: &mut egui::Ui, board: Board, selected: bool) -> egui::Respon
         center,
         radius,
         Stroke::new(
-            if selected { 3.2 } else { 2.0 },
+            if selected { 3.2_f32 } else { 2.0_f32 },
             if selected {
                 BRIGHT_ORANGE
             } else {
@@ -2074,7 +2078,7 @@ fn board_button(ui: &mut egui::Ui, board: Board, selected: bool) -> egui::Respon
         let badge = center + Vec2::new(40.0, -39.0);
         ui.painter().circle_filled(badge, 15.0, BRIGHT_ORANGE);
         ui.painter()
-            .circle_stroke(badge, 15.0, Stroke::new(3.0, BACKGROUND));
+            .circle_stroke(badge, 15.0, Stroke::new(3.0_f32, BACKGROUND));
         paint_checkmark(ui.painter(), badge, 15.0, Color32::BLACK, 2.4);
     }
 
@@ -2142,15 +2146,19 @@ fn drive_icon(ui: &mut egui::Ui, color: Color32, size: f32) {
         Vec2::new(size * 0.58, size * 0.68),
     );
     ui.painter().rect_filled(body, 6.0, ELEVATED);
-    ui.painter()
-        .rect_stroke(body, 6.0, Stroke::new(2.6, color), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        body,
+        6.0,
+        Stroke::new(2.6_f32, color),
+        egui::StrokeKind::Inside,
+    );
     let baseline_y = size.mul_add(-0.15, body.bottom());
     ui.painter().line_segment(
         [
             egui::pos2(size.mul_add(0.10, body.left()), baseline_y),
             egui::pos2(size.mul_add(-0.10, body.right()), baseline_y),
         ],
-        Stroke::new(2.0, color),
+        Stroke::new(2.0_f32, color),
     );
     ui.painter().circle_filled(
         egui::pos2(
@@ -2188,7 +2196,7 @@ fn setup_action_button(label: &str, size: Vec2, enabled: bool) -> egui::Button<'
     )
     .fill(if enabled { ORANGE } else { ELEVATED })
     .stroke(Stroke::new(
-        1.0,
+        1.0_f32,
         if enabled {
             Color32::from_rgb(242, 154, 65)
         } else {
@@ -2237,7 +2245,7 @@ fn primary_button(label: &str, size: Vec2) -> egui::Button<'_> {
 fn secondary_button(label: &str, size: Vec2) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(TEXT).strong())
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0, Color32::from_gray(100)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_gray(100)))
         .corner_radius(size.y / 2.0)
         .min_size(size)
 }
@@ -2252,7 +2260,7 @@ fn branded_modal<T>(
         .frame(
             egui::Frame::new()
                 .fill(SURFACE)
-                .stroke(Stroke::new(1.0, Color32::from_gray(76)))
+                .stroke(Stroke::new(1.0_f32, Color32::from_gray(76)))
                 .corner_radius(18.0)
                 .inner_margin(egui::Margin::same(24)),
         )
@@ -2272,7 +2280,7 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
 fn third_party_license_card(ui: &mut egui::Ui, index: usize, license: &ThirdPartyLicenseGroup) {
     egui::Frame::new()
         .fill(SURFACE)
-        .stroke(Stroke::new(1.0, Color32::from_gray(58)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_gray(58)))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(14, 11))
         .show(ui, |ui| {

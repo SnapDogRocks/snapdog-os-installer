@@ -5,7 +5,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
@@ -13,9 +12,9 @@ use super::{
     WorkerDrive, WorkerError, WorkerPlatform, WorkerTarget, compare_drive, disk_identifier,
 };
 use crate::drives;
+use crate::macos_native;
 use unix_ancillary::UnixStreamExt;
 
-const DISKUTIL: &str = "/usr/sbin/diskutil";
 const TARGET_SETTLE_ATTEMPTS: usize = 25;
 const TARGET_SETTLE_DELAY: Duration = Duration::from_millis(100);
 const TARGET_FD_REQUEST: &[u8] = b"SNAPDOG_TARGET_FD_REQUEST_V1\n";
@@ -97,8 +96,8 @@ impl WorkerPlatform for MacOsPlatform {
             "validating selected macOS target"
         );
 
-        // `diskutil list -plist physical` can omit Apple's built-in SDXC reader immediately after
-        // `unmountDisk`, and Disk Arbitration can briefly remove the corresponding IOMedia entry
+        // Disk Arbitration can briefly remove Apple's built-in SDXC reader's corresponding IOMedia
+        // entry while an unmount settles
         // while it settles the now-unmounted medium. Require the exact same stable registry ID and
         // safety fields, but tolerate that short transition instead of treating its first snapshot
         // as a hot-unplug. A genuinely removed or replaced card still fails closed after 2.5 s.
@@ -129,11 +128,13 @@ impl WorkerPlatform for MacOsPlatform {
 
     fn unmount(&mut self, selected: &WorkerDrive) -> Result<(), WorkerError> {
         compare_drive(selected, &self.validate_target(selected)?)?;
+        let disk_id = disk_identifier(&selected.id).ok_or(WorkerError::UnsafeTarget)?;
         tracing::info!(device = selected.device, "unmounting all target volumes");
-        diskutil(["unmountDisk", selected.device.as_str()])?;
+        macos_native::unmount_whole_disk(disk_id)
+            .map_err(|error| WorkerError::Platform(error.to_string()))?;
         tracing::info!(
             device = selected.device,
-            "diskutil reported successful unmount"
+            "Disk Arbitration reported successful unmount"
         );
         compare_drive(selected, &self.validate_target(selected)?)
     }
@@ -155,10 +156,11 @@ impl WorkerPlatform for MacOsPlatform {
     }
 
     fn eject(&mut self, selected: &WorkerDrive) -> Result<(), WorkerError> {
-        // Cleanup can run after a hot-unplug failure. Never apply `diskutil eject` to a new medium
+        // Cleanup can run after a hot-unplug failure. Never eject a new medium
         // that inherited the selected BSD path after the original card disappeared.
         compare_drive(selected, &self.validate_target(selected)?)?;
-        diskutil(["eject", selected.device.as_str()]).map(|_| ())
+        let disk_id = disk_identifier(&selected.id).ok_or(WorkerError::UnsafeTarget)?;
+        macos_native::eject_disk(disk_id).map_err(|error| WorkerError::Platform(error.to_string()))
     }
 }
 
@@ -230,30 +232,6 @@ where
         "target lookup exhausted its settling window"
     );
     Ok(None)
-}
-
-fn diskutil<const N: usize>(arguments: [&str; N]) -> Result<Output, WorkerError> {
-    tracing::debug!(arguments = ?arguments, "running diskutil");
-    let output = Command::new(DISKUTIL)
-        .args(arguments)
-        .output()
-        .map_err(|error| WorkerError::Platform(error.to_string()))?;
-    if output.status.success() {
-        tracing::debug!(
-            arguments = ?arguments,
-            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "diskutil completed successfully"
-        );
-        Ok(output)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(WorkerError::Platform(if stderr.is_empty() {
-            format!("diskutil failed with status {}", output.status)
-        } else {
-            stderr
-        }))
-    }
 }
 
 #[cfg(test)]

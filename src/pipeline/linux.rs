@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Linux elevation and progress monitoring for the privileged worker.
+//! Linux progress monitoring for the UDisks2-authorized worker.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -24,79 +24,13 @@ const MAX_PROGRESS_RECORD: usize = 64 * 1024;
 const MAX_HELPER_STDERR: u64 = 256 * 1024;
 const MAX_WORKER_JOB_SIZE: u64 = 64 * 1024;
 const O_NOFOLLOW: i32 = 0o400_000;
-const PKEXEC_CANDIDATES: &[&str] = &["/usr/bin/pkexec", "/bin/pkexec"];
-const BASH_CANDIDATES: &[&str] = &["/usr/bin/bash", "/bin/bash"];
-const INSTALL_CANDIDATES: &[&str] = &["/usr/bin/install", "/bin/install"];
-const MKTEMP_CANDIDATES: &[&str] = &["/usr/bin/mktemp", "/bin/mktemp"];
-const SHA256SUM_CANDIDATES: &[&str] = &["/usr/bin/sha256sum", "/bin/sha256sum"];
-const REMOVE_CANDIDATES: &[&str] = &["/usr/bin/rm", "/bin/rm"];
-const APPIMAGE_ENVIRONMENT: &str = "APPIMAGE";
-const APPDIR_ENVIRONMENT: &str = "APPDIR";
+const RAW_DEVICE_OPT_IN: &str = "SNAPDOG_INSTALLER_ALLOW_UDISKS_WRITE";
+const RAW_DEVICE_OPT_IN_VALUE: &str = "YES-I-UNDERSTAND";
 
-// Dynamic values reach this constant program only as positional arguments. The root shell copies
-// the user-owned executable into a private root-owned directory and verifies the copy against the
-// digest of the descriptor pinned before PolicyKit authorization. This closes the interactive
-// prompt TOCTOU without installing a second SnapDog binary.
-const ROOT_LAUNCH_PROGRAM: &str = r#"
-set -euo pipefail
-if [[ $# -ne 10 ]]; then
-  echo 'invalid SnapDog root-launch argument count' >&2
-  exit 64
-fi
-
-install_tool=$1
-mktemp_tool=$2
-sha256sum_tool=$3
-remove_tool=$4
-source_executable=$5
-expected_executable_sha256=$6
-worker_job_argument=$7
-job_path=$8
-worker_job_sha256_argument=$9
-expected_job_sha256=${10}
-root_directory=
-
-if [[ $worker_job_argument != --worker-job ||
-      $worker_job_sha256_argument != --worker-job-sha256 ]]; then
-  echo 'invalid SnapDog worker argument contract' >&2
-  exit 64
-fi
-
-cleanup() {
-  if [[ -n ${root_directory:-} ]]; then
-    "$remove_tool" -rf -- "$root_directory"
-  fi
-}
-trap cleanup EXIT HUP INT TERM
-
-umask 077
-root_directory=$("$mktemp_tool" -d /tmp/snapdog-os-installer-root.XXXXXXXXXX)
-"$install_tool" -d -m 0700 -- "$root_directory"
-root_executable=$root_directory/snapdog-os-installer
-"$install_tool" -m 0500 -- "$source_executable" "$root_executable"
-
-actual_executable_sha256=$("$sha256sum_tool" -- "$root_executable")
-actual_executable_sha256=${actual_executable_sha256%% *}
-if [[ $actual_executable_sha256 != "$expected_executable_sha256" ]]; then
-  echo 'SnapDog executable changed during PolicyKit authorization' >&2
-  exit 1
-fi
-
-set +e
-APPIMAGE_EXTRACT_AND_RUN=1 "$root_executable" \
-  "$worker_job_argument" "$job_path" \
-  "$worker_job_sha256_argument" "$expected_job_sha256"
-status=$?
-set -e
-exit "$status"
-"#;
-
-/// Launches this executable as a root worker through `PolicyKit`'s native authorization prompt.
+/// Re-enters this executable as an unprivileged worker. `UDisks2` performs scoped authorization.
 #[derive(Clone, Debug)]
 pub struct LinuxWorkerRunner {
     executable: PathBuf,
-    pkexec: PathBuf,
-    helpers: TrustedHelpers,
 }
 
 impl LinuxWorkerRunner {
@@ -104,57 +38,20 @@ impl LinuxWorkerRunner {
     pub fn current() -> Result<Self, WorkerRunnerError> {
         let executable = worker_executable()?;
         validate_executable(&executable)?;
-        let pkexec = find_pkexec()?;
-        let helpers = TrustedHelpers::find()?;
-        Ok(Self {
-            executable,
-            pkexec,
-            helpers,
-        })
+        Ok(Self { executable })
     }
 
-    /// Use explicit executable and `pkexec` paths.
+    /// Use an explicit executable path. The second argument is retained for API compatibility.
     ///
     /// This constructor is intended for packaged-launch plumbing and integration tests. Both paths
     /// are still validated before every launch.
-    pub fn with_paths(executable: PathBuf, pkexec: PathBuf) -> Self {
-        Self {
-            executable,
-            pkexec,
-            helpers: TrustedHelpers::standard_paths(),
-        }
+    pub fn with_paths(executable: PathBuf, _authorization_helper: PathBuf) -> Self {
+        Self { executable }
     }
 }
 
 fn worker_executable() -> Result<PathBuf, WorkerRunnerError> {
-    let current = std::env::current_exe()?;
-    match (
-        std::env::var_os(APPIMAGE_ENVIRONMENT),
-        std::env::var_os(APPDIR_ENVIRONMENT),
-    ) {
-        (None, None) => Ok(current),
-        (Some(appimage), Some(appdir)) => {
-            let appimage = PathBuf::from(appimage);
-            let appdir = PathBuf::from(appdir);
-            if !appimage.is_absolute()
-                || !appdir.is_absolute()
-                || !current.starts_with(&appdir)
-                || appimage.starts_with(&appdir)
-            {
-                return Err(WorkerRunnerError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "inconsistent AppImage runtime paths",
-                )));
-            }
-            // The outer AppImage creates a fresh root-visible mount after PolicyKit approval;
-            // current_exe itself lives in the user's FUSE mount and is not traversable by root.
-            Ok(appimage)
-        }
-        _ => Err(WorkerRunnerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "incomplete AppImage runtime environment",
-        ))),
-    }
+    std::env::current_exe().map_err(WorkerRunnerError::Io)
 }
 
 impl WorkerRunner for LinuxWorkerRunner {
@@ -164,18 +61,10 @@ impl WorkerRunner for LinuxWorkerRunner {
         progress: &mut dyn FnMut(WorkerProgress),
     ) -> Result<(), WorkerRunnerError> {
         validate_executable(&self.executable)?;
-        validate_pkexec(&self.pkexec)?;
-        self.helpers.validate()?;
         let pinned = PinnedLaunchFiles::open(&self.executable, launch.job_path)?;
         let launch_identity = pinned.identity;
         let mut tail = ProgressTail::open(launch.progress_path)?;
-        let mut process = ElevatedProcess::spawn(
-            &self.pkexec,
-            &self.executable,
-            launch.job_path,
-            &self.helpers,
-            pinned,
-        )?;
+        let mut process = ElevatedProcess::spawn(&self.executable, launch.job_path, pinned)?;
         let mut monitor_error = None;
         let mut cancellation_sent = false;
 
@@ -206,9 +95,8 @@ impl WorkerRunner for LinuxWorkerRunner {
                 {
                     monitor_error = Some(WorkerRunnerError::Io(error));
                 }
-                // Before the first worker event, pkexec is normally waiting for PolicyKit. Stop
-                // it to dismiss that prompt. If authorization raced, the marker makes the root
-                // worker stop at its next safe boundary and this runner continues monitoring it.
+                // Before the first worker event, UDisks2 may be waiting for PolicyKit. Stop the
+                // worker to dismiss that prompt; otherwise the marker stops at the next boundary.
                 if !tail.saw_event()
                     && let Err(error) = process.request_stop()
                     && monitor_error.is_none()
@@ -253,50 +141,10 @@ impl WorkerRunner for LinuxWorkerRunner {
     }
 }
 
-#[derive(Clone, Debug)]
-struct TrustedHelpers {
-    shell: PathBuf,
-    install: PathBuf,
-    mktemp: PathBuf,
-    sha256sum: PathBuf,
-    remove: PathBuf,
-}
-
-impl TrustedHelpers {
-    fn find() -> Result<Self, WorkerRunnerError> {
-        Ok(Self {
-            shell: find_trusted_helper(BASH_CANDIDATES, "bash")?,
-            install: find_trusted_helper(INSTALL_CANDIDATES, "install")?,
-            mktemp: find_trusted_helper(MKTEMP_CANDIDATES, "mktemp")?,
-            sha256sum: find_trusted_helper(SHA256SUM_CANDIDATES, "sha256sum")?,
-            remove: find_trusted_helper(REMOVE_CANDIDATES, "rm")?,
-        })
-    }
-
-    fn standard_paths() -> Self {
-        Self {
-            shell: PathBuf::from(BASH_CANDIDATES[0]),
-            install: PathBuf::from(INSTALL_CANDIDATES[0]),
-            mktemp: PathBuf::from(MKTEMP_CANDIDATES[0]),
-            sha256sum: PathBuf::from(SHA256SUM_CANDIDATES[0]),
-            remove: PathBuf::from(REMOVE_CANDIDATES[0]),
-        }
-    }
-
-    fn validate(&self) -> Result<(), WorkerRunnerError> {
-        validate_trusted_helper(&self.shell, "bash")?;
-        validate_trusted_helper(&self.install, "install")?;
-        validate_trusted_helper(&self.mktemp, "mktemp")?;
-        validate_trusted_helper(&self.sha256sum, "sha256sum")?;
-        validate_trusted_helper(&self.remove, "rm")
-    }
-}
-
 struct PinnedLaunchFiles {
     _executable: File,
     _job: File,
     identity: LaunchIdentity,
-    executable_sha256: String,
     job_sha256: String,
 }
 
@@ -311,7 +159,6 @@ impl PinnedLaunchFiles {
                 executable: executable.identity,
                 job: job.identity,
             },
-            executable_sha256: executable.sha256,
             job_sha256: job.sha256,
         })
     }
@@ -458,64 +305,6 @@ impl FileIdentity {
     }
 }
 
-fn find_pkexec() -> Result<PathBuf, WorkerRunnerError> {
-    let path = find_trusted_helper(PKEXEC_CANDIDATES, "pkexec").map_err(|error| match error {
-        WorkerRunnerError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
-            WorkerRunnerError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                "pkexec is required for privileged SD-card writing; install PolicyKit/polkit",
-            ))
-        }
-        other => other,
-    })?;
-    validate_pkexec(&path)?;
-    Ok(path)
-}
-
-fn find_trusted_helper(candidates: &[&str], name: &str) -> Result<PathBuf, WorkerRunnerError> {
-    let path = candidates
-        .iter()
-        .map(Path::new)
-        .find(|path| path.is_file())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            WorkerRunnerError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("required privileged-launch helper `{name}` is unavailable"),
-            ))
-        })?;
-    validate_trusted_helper(&path, name)?;
-    Ok(path)
-}
-
-fn validate_pkexec(path: &Path) -> Result<(), WorkerRunnerError> {
-    validate_trusted_helper(path, "pkexec")
-}
-
-fn validate_trusted_helper(path: &Path, name: &str) -> Result<(), WorkerRunnerError> {
-    if !path.is_absolute() {
-        return Err(WorkerRunnerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} path must be absolute"),
-        )));
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o111 == 0
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(WorkerRunnerError::Io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{name} must be a non-symlink root-owned executable that is not group- or world-writable"
-            ),
-        )));
-    }
-    Ok(())
-}
-
 fn validate_executable(path: &Path) -> Result<(), WorkerRunnerError> {
     if !path.is_absolute() {
         return Err(WorkerRunnerError::Io(io::Error::new(
@@ -541,7 +330,7 @@ fn validate_executable(path: &Path) -> Result<(), WorkerRunnerError> {
 fn stderr_message(stderr: &[u8]) -> String {
     let message = String::from_utf8_lossy(stderr).trim().to_owned();
     if message.is_empty() {
-        "PolicyKit authorization was denied or the privileged worker returned no details".to_owned()
+        "UDisks2 authorization was denied or the worker returned no details".to_owned()
     } else {
         message
     }
@@ -555,27 +344,16 @@ struct ElevatedProcess {
 
 impl ElevatedProcess {
     fn spawn(
-        pkexec: &Path,
         executable: &Path,
         job_path: &Path,
-        helpers: &TrustedHelpers,
         pins: PinnedLaunchFiles,
     ) -> Result<Self, WorkerRunnerError> {
-        // Every dynamic value is a separate positional argument to a constant root program.
-        let mut child = Command::new(pkexec)
-            .arg(&helpers.shell)
-            .args(["--noprofile", "--norc", "-p", "-c", ROOT_LAUNCH_PROGRAM])
-            .arg("snapdog-root-launch")
-            .arg(&helpers.install)
-            .arg(&helpers.mktemp)
-            .arg(&helpers.sha256sum)
-            .arg(&helpers.remove)
-            .arg(executable)
-            .arg(&pins.executable_sha256)
+        let mut child = Command::new(executable)
             .arg(WORKER_JOB_ARGUMENT)
             .arg(job_path)
             .arg(WORKER_JOB_SHA256_ARGUMENT)
             .arg(&pins.job_sha256)
+            .env(RAW_DEVICE_OPT_IN, RAW_DEVICE_OPT_IN_VALUE)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -589,7 +367,7 @@ impl ElevatedProcess {
             let _ = child.kill();
             let _ = child.wait();
             return Err(WorkerRunnerError::Io(io::Error::other(
-                "failed to capture pkexec stderr",
+                "failed to capture worker stderr",
             )));
         };
         let stderr_reader = thread::spawn(move || {
@@ -770,13 +548,12 @@ mod tests {
     fn explicit_paths_are_retained_without_command_construction() {
         let runner = LinuxWorkerRunner::with_paths(
             PathBuf::from("/opt/snapdog/snapdog-os-installer"),
-            PathBuf::from("/usr/bin/pkexec"),
+            PathBuf::from("/unused/compatibility-argument"),
         );
         assert_eq!(
             runner.executable,
             PathBuf::from("/opt/snapdog/snapdog-os-installer")
         );
-        assert_eq!(runner.pkexec, PathBuf::from("/usr/bin/pkexec"));
     }
 
     #[test]
@@ -813,27 +590,12 @@ mod tests {
 
         let pinned = PinnedLaunchFiles::open(&executable, &job).unwrap();
         assert_eq!(
-            pinned.executable_sha256,
-            hex::encode(Sha256::digest(b"trusted executable"))
-        );
-        assert_eq!(
             pinned.job_sha256,
             hex::encode(Sha256::digest(b"{\"schema_version\":1}"))
         );
 
         fs::write(&executable, b"replacement").unwrap();
         assert!(pinned.identity.ensure_unchanged(&executable, &job).is_err());
-    }
-
-    #[test]
-    fn root_launch_program_has_a_fixed_copy_and_digest_boundary() {
-        assert!(ROOT_LAUNCH_PROGRAM.contains("install_tool=$1"));
-        assert!(ROOT_LAUNCH_PROGRAM.contains("-m 0500"));
-        assert!(ROOT_LAUNCH_PROGRAM.contains("actual_executable_sha256"));
-        assert!(ROOT_LAUNCH_PROGRAM.contains("APPIMAGE_EXTRACT_AND_RUN=1"));
-        assert!(ROOT_LAUNCH_PROGRAM.contains("--worker-job-sha256"));
-        assert!(!ROOT_LAUNCH_PROGRAM.contains("eval"));
-        assert!(!ROOT_LAUNCH_PROGRAM.contains("source "));
     }
 
     #[test]

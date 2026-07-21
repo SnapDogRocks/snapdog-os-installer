@@ -6,7 +6,7 @@ export RUSTFLAGS="-Dwarnings"
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
-cargo +1.88.0 check --locked --all-targets
+cargo check --locked --all-targets
 cargo deny check
 cargo audit
 
@@ -60,6 +60,15 @@ from pathlib import Path
 
 root = Path.cwd()
 
+toolchain = tomllib.loads((root / "rust-toolchain.toml").read_text())["toolchain"]
+toolchain_version = toolchain["channel"]
+toolchain_parts = toolchain_version.split(".")
+assert len(toolchain_parts) == 3 and all(part.isdigit() for part in toolchain_parts)
+assert toolchain["profile"] == "minimal"
+assert set(toolchain["components"]) == {"clippy", "rustfmt"}
+package = tomllib.loads((root / "Cargo.toml").read_text())["package"]
+assert package["rust-version"] == ".".join(toolchain_parts[:2])
+
 release_config = json.loads((root / "release-please-config.json").read_text())
 release_manifest = json.loads(
     (root / ".release-please-manifest.json").read_text()
@@ -89,6 +98,11 @@ release_workflow = (root / ".github/workflows/release.yml").read_text()
 assert 'gh release upload "$GITHUB_REF_NAME"' in release_workflow
 assert 'gh release edit "$GITHUB_REF_NAME"' in release_workflow
 assert "--draft=false" in release_workflow
+assert "RUST_VERSION" not in release_workflow
+assert release_workflow.count("environment: release") == 2
+
+ci_workflow = (root / ".github/workflows/ci.yml").read_text()
+assert "RUST_VERSION" not in ci_workflow
 
 macos_pipeline = (root / "src/pipeline/macos.rs").read_text()
 runtime_requirement = re.search(
@@ -108,6 +122,23 @@ assert ".env(RAW_DEVICE_OPT_IN, RAW_DEVICE_OPT_IN_VALUE)" in macos_pipeline
 assert "Command::new(executable)" in macos_pipeline
 assert '.arg(AUTHOPEN_RAW_FLAGS)' in macos_pipeline
 assert '.arg("--requirement")' not in macos_pipeline
+macos_runtime = "\n".join(
+    (root / path).read_text()
+    for path in ["src/drives.rs", "src/worker/macos.rs", "src/pipeline/macos.rs"]
+)
+for command in ["/usr/sbin/diskutil", "/usr/sbin/ioreg", "/usr/bin/codesign"]:
+    assert f'Command::new("{command}")' not in macos_runtime
+macos_native = (root / "src/macos_native.rs").read_text()
+for framework in ["IOServiceMatching", "DASession", "SecStaticCode"]:
+    assert framework in macos_native
+
+linux_pipeline = (root / "src/pipeline/linux.rs").read_text()
+linux_worker = (root / "src/worker/linux.rs").read_text()
+assert "Command::new(executable)" in linux_pipeline
+assert "org.freedesktop.UDisks2.Block" in linux_worker
+for command in ["pkexec", "udisksctl", "blockdev", "sha256sum", "/bin/umount", "/bin/eject"]:
+    assert command not in linux_pipeline
+    assert command not in linux_worker
 assert '"-R=$WORKER_REQUIREMENT"' in macos_packager
 assert "umask 077" in macos_packager
 assert "UNVALIDATED_DMG" in macos_packager
@@ -115,6 +146,10 @@ assert 'mv -f "$UNVALIDATED_DMG" "$DMG"' in macos_packager
 assert 'security list-keychains -d user -s "$KEYCHAIN"' in macos_packager
 assert 'security default-keychain -d user -s "$KEYCHAIN"' in macos_packager
 assert "did not provide a usable Developer ID Application identity" in macos_packager
+assert "--overwrite" not in macos_packager
+assert macos_packager.index("CREATE_DMG_HELP=$(create-dmg --help") < (
+    macos_packager.index("cargo build --locked --release")
+)
 assert macos_packager.index("SIGN_IDENTITY=$(security find-identity") < (
     macos_packager.index("security set-key-partition-list")
 )

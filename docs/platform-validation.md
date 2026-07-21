@@ -40,14 +40,14 @@ confirm the exact medium before each destructive run.
   provide the required hot-plug identity.
 - Confirm the packaged executable needs no symbol newer than GLIBC 2.28. Test each native AppImage
   on both an older GLIBC 2.28 userland running a supported kernel and a current desktop.
-- Confirm the outer AppImage successfully re-enters through PolicyKit; the private FUSE mount must
-  not cause an executable-permission failure.
+- Confirm UDisks2 2.7.3 or newer is installed and its PolicyKit prompt appears for the unprivileged
+  AppImage worker's scoped `OpenDevice`, unmount, and power-off requests.
+- Confirm the same executable re-enters directly from the AppImage's private FUSE mount.
 - Test common `/media/...` and `/run/media/...` automount layouts and verify unexpected mounts such
   as `/home`, `/var`, `/root`, `/nix`, or `/srv` are refused.
-- Test systems with and without `udisksctl`/`eject`; a synced and unmounted card remains a successful
-  write even when automatic power-off is unavailable.
-- Confirm `blockdev --flushbufs` is available from util-linux and that verified writes perform a
-  true post-flush readback rather than accepting cached write pages.
+- Test UDisks2 drive `PowerOff` and `Eject` fallbacks on USB readers and built-in SD readers.
+- Confirm verified writes reopen the target through UDisks2 with `O_DIRECT` and perform aligned
+  cache-bypassing reads after the synchronous write descriptor is closed.
 
 ## Windows
 

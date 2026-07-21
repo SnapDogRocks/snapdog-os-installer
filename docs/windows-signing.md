@@ -9,7 +9,8 @@ Windows executables; all other release validation remains mandatory.
 
 Create a Public Trust signing account and certificate profile, then grant the GitHub federated
 identity the **Artifact Signing Certificate Profile Signer** role. Configure GitHub OIDC for this
-repository and release environment; no client secret is required.
+repository's `release` environment; no client secret is required. The environment restricts
+deployments to release tags but does not require manual approval.
 
 Repository secrets:
 
