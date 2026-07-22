@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.2...v0.2.3) (2026-07-22)
+
+
+### Bug Fixes
+
+* **release:** use repository dispatch for website sync ([#17](https://github.com/SnapDogRocks/snapdog-os-installer/issues/17)) ([ee5d1d6](https://github.com/SnapDogRocks/snapdog-os-installer/commit/ee5d1d634bb856d5d82822176db126bc9249f80e))
+
 ## [0.2.2](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.1...v0.2.2) (2026-07-22)
 
 
