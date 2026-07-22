@@ -1,0 +1,47 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:0.99216,0.98039,0.94902,1.00000",
+      "display-p3:0.90588,0.81961,0.72157,1.00000"
+    ],
+    "orientation" : {
+      "start" : {
+        "x" : 0,
+        "y" : 0
+      },
+      "stop" : {
+        "x" : 1,
+        "y" : 1
+      }
+    }
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "SnapDog.png",
+          "name" : "SnapDog SD Card",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              2.2749999999999204,
+              33.21499999999992
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.42
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}

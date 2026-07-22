@@ -142,6 +142,7 @@ if [[ "$ARCHS" != "arm64 x86_64" && "$ARCHS" != "x86_64 arm64" ]]; then
 fi
 sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
+cp assets/Assets.car "$APP/Contents/Resources/Assets.car"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp THIRD_PARTY_NOTICES.txt "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
 chmod -R u+rwX,go+rX "$APP"
