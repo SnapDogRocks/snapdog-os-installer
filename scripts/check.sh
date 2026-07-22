@@ -100,9 +100,9 @@ assert 'gh release edit "$GITHUB_REF_NAME"' in release_workflow
 assert "--draft=false" in release_workflow
 assert "Require website release automation token" in release_workflow
 assert "secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN" in release_workflow
-assert "gh workflow run update-installer-release.yml" in release_workflow
-assert "--repo SnapDogRocks/snapdog-web" in release_workflow
-assert "-f tag=\"$GITHUB_REF_NAME\"" in release_workflow
+assert "repos/SnapDogRocks/snapdog-web/dispatches" in release_workflow
+assert "event_type=snapdog-os-installer-release" in release_workflow
+assert 'client_payload[tag]=$GITHUB_REF_NAME' in release_workflow
 assert release_workflow.index("Require website release automation token") < (
     release_workflow.index("      - name: Publish GitHub release")
 )
