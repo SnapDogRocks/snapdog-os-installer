@@ -427,7 +427,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN }}
         run: |
           set -euo pipefail
-          gh workflow run update-installer-release.yml \
-            --repo SnapDogRocks/snapdog-web \
-            --ref main \
-            -f tag="$GITHUB_REF_NAME"
+          gh api --method POST \
+            repos/SnapDogRocks/snapdog-web/dispatches \
+            -f event_type=snapdog-os-installer-release \
+            -F "client_payload[tag]=$GITHUB_REF_NAME"
