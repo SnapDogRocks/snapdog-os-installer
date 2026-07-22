@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.1...v0.2.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **macos:** ship native rounded app icon ([#15](https://github.com/SnapDogRocks/snapdog-os-installer/issues/15)) ([dfb9e78](https://github.com/SnapDogRocks/snapdog-os-installer/commit/dfb9e783a33c991e66d55903b6e8ea3f53883d4b))
+
 ## [0.2.1](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.0...v0.2.1) (2026-07-21)
 
 
