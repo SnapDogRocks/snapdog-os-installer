@@ -211,6 +211,8 @@ assert static_windows_flags in release_workflow
 info = plistlib.loads((root / "packaging/macos/Info.plist").read_bytes())
 assert info["CFBundleIdentifier"] == "cc.snapdog.os-installer"
 assert info["CFBundleExecutable"] == "SnapDog OS Installer"
+assert info["CFBundleIconFile"] == "icon"
+assert info["CFBundleIconName"] == "AppIcon"
 assert info["CFBundleShortVersionString"] == "__VERSION__"
 assert info["NSRemovableVolumesUsageDescription"] == (
     "SnapDog OS Installer needs access to removable volumes to write and verify "
@@ -242,9 +244,31 @@ assert png_dimensions(root / "packaging/linux/cc.snapdog.os-installer.png") == (
 assert png_dimensions(root / "assets/icon.png") == (1024, 1024)
 assert png_dimensions(root / "assets/icon-windows.png") == (1024, 1024)
 assert png_dimensions(root / "assets/icon-macos.png") == (1024, 1024)
+assert png_dimensions(root / "assets/AppIcon.icon/Assets/SnapDog.png") == (1024, 1024)
 assert png_dimensions(root / "assets/dmg/background.png") == (600, 400)
 assert (root / "assets/icon.icns").read_bytes()[:4] == b"icns"
+assert (root / "assets/Assets.car").read_bytes()[:8] == b"BOMStore"
 assert (root / "assets/icon.ico").read_bytes()[:4] == b"\x00\x00\x01\x00"
+
+icon_document = json.loads((root / "assets/AppIcon.icon/icon.json").read_text())
+assert icon_document["supported-platforms"]["squares"] == "shared"
+assert "linear-gradient" in icon_document["fill"]
+assert len(icon_document["groups"]) == 1
+icon_group = icon_document["groups"][0]
+assert icon_group["shadow"]["kind"] == "neutral"
+assert 0 < icon_group["shadow"]["opacity"] <= 1
+assert len(icon_group["layers"]) == 1
+icon_layer = icon_group["layers"][0]
+assert icon_layer["image-name"] == "SnapDog.png"
+assert icon_layer["name"] == "SnapDog SD Card"
+assert icon_layer.get("glass") is False
+assert 0 < icon_layer["position"]["scale"] <= 1
+assert len(icon_layer["position"]["translation-in-points"]) == 2
+
+package_macos = (root / "scripts/package-macos.sh").read_text()
+debug_macos = (root / "scripts/run-macos-debug.sh").read_text()
+assert 'cp assets/Assets.car "$APP/Contents/Resources/Assets.car"' in package_macos
+assert 'cp assets/Assets.car "$APP/Contents/Resources/Assets.car"' in debug_macos
 
 main_source = (root / "src/main.rs").read_text()
 assert '#[cfg(target_os = "windows")]' in main_source
