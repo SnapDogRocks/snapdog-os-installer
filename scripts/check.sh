@@ -106,7 +106,9 @@ assert 'gh release upload "$RELEASE_TAG"' in release_workflow
 assert 'gh release edit "$RELEASE_TAG"' in release_workflow
 assert "--draft=false" in release_workflow
 assert "anchore/sbom-action/download-syft@" in release_workflow
+assert "syft-version: v1.51.1" in release_workflow
 assert "sigstore/cosign-installer@" in release_workflow
+assert release_workflow.count("cosign-release: v3.0.6") == 3
 assert "cosign sign-blob" in release_workflow
 assert "cosign verify-blob" in release_workflow
 assert "actions/attest-build-provenance@" in release_workflow

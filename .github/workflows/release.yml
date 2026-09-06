@@ -366,6 +366,8 @@ jobs:
       - name: Install pinned Syft
         id: syft
         uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          syft-version: v1.51.1
       - name: Generate one SPDX SBOM per payload
         env:
           SYFT: ${{ steps.syft.outputs.cmd }}
@@ -378,6 +380,8 @@ jobs:
           done < <(./scripts/release-assets.sh list-payloads "$VERSION")
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
       - name: Sign every payload with keyless Sigstore
         env:
           VERSION: ${{ needs.validate-tag.outputs.version }}
@@ -519,6 +523,8 @@ jobs:
           exit 1
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
       - name: Verify public bytes, signatures, checksums, and attestations
         env:
           GH_TOKEN: ${{ github.token }}
@@ -566,6 +572,8 @@ jobs:
         run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir public-release
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
       - name: Reverify public candidate before promotion
         env:
           GH_TOKEN: ${{ github.token }}
