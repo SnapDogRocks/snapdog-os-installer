@@ -488,9 +488,14 @@ jobs:
               --draft \
               --verify-tag \
               --title "SnapDog OS Installer $RELEASE_TAG"
-            release_json=$(find_release)
+            release_json=
+            for _ in {1..10}; do
+              release_json=$(find_release)
+              [[ -n "$release_json" ]] && break
+              sleep 2
+            done
             [[ -n "$release_json" ]] || {
-              echo "Draft release was created but cannot be read back." >&2
+              echo "Draft release was created but cannot be read back after 20 seconds." >&2
               exit 1
             }
           fi
