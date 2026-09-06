@@ -131,7 +131,7 @@ assert "CI Success" in ci_workflow
 assert "ubuntu-24.04-arm" in ci_workflow
 assert "windows-2025" in ci_workflow
 assert "cargo llvm-cov nextest" in ci_workflow
-assert "gitleaks/gitleaks-action@" in ci_workflow
+assert "gitleaks git --redact --verbose" in ci_workflow
 assert "macos-" not in ci_workflow
 
 for workflow in (root / ".github/workflows").glob("*.yml"):
