@@ -613,6 +613,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Mint short-lived website automation token
         id: app-token
