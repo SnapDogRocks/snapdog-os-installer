@@ -419,6 +419,10 @@ jobs:
   stage:
     name: Stage and verify public prerelease
     needs: [validate-tag, candidate]
+    if: >-
+      ${{ always() &&
+          needs.validate-tag.result == 'success' &&
+          needs.candidate.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 30
@@ -671,3 +675,33 @@ jobs:
           done
           echo "snapdog-web main does not reference $RELEASE_TAG" >&2
           exit 1
+
+  release-success:
+    name: Release Success
+    needs: [validate-tag, candidate, stage, promote, notify-website]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the complete release path to pass
+        env:
+          PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
+          VALIDATE_RESULT: ${{ needs.validate-tag.result }}
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
+          STAGE_RESULT: ${{ needs.stage.result }}
+          PROMOTE_RESULT: ${{ needs.promote.result }}
+          NOTIFY_RESULT: ${{ needs.notify-website.result }}
+        run: |
+          set -euo pipefail
+          [[ "$VALIDATE_RESULT" == success ]]
+          [[ "$CANDIDATE_RESULT" == success ]]
+          [[ "$STAGE_RESULT" == success ]]
+          if [[ "$PRERELEASE" == true ]]; then
+            [[ "$PROMOTE_RESULT" == skipped ]]
+            [[ "$NOTIFY_RESULT" == skipped ]]
+          else
+            [[ "$PROMOTE_RESULT" == success ]]
+            [[ "$NOTIFY_RESULT" == success ]]
+          fi
