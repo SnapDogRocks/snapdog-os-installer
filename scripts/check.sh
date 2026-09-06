@@ -5,10 +5,9 @@ export RUSTFLAGS="-Dwarnings"
 
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features
+cargo nextest run --locked --all-features
 cargo check --locked --all-targets
 cargo deny check
-cargo audit
 
 NOTICES=$(mktemp)
 trap 'rm -f "$NOTICES"' EXIT
@@ -48,6 +47,7 @@ pwsh -NoLogo -NoProfile -NonInteractive -Command '
 '
 
 ./scripts/check-live-manifests.py --self-test
+./scripts/test-release-assets.sh
 
 python3 - <<'PY'
 import json
@@ -67,7 +67,7 @@ assert len(toolchain_parts) == 3 and all(part.isdigit() for part in toolchain_pa
 assert toolchain["profile"] == "minimal"
 assert set(toolchain["components"]) == {"clippy", "rustfmt"}
 package = tomllib.loads((root / "Cargo.toml").read_text())["package"]
-assert package["rust-version"] == ".".join(toolchain_parts[:2])
+assert "rust-version" not in package
 
 release_config = json.loads((root / "release-please-config.json").read_text())
 release_manifest = json.loads(
@@ -90,30 +90,60 @@ assert release_manifest == {".": "0.0.0"} or release_manifest == {
 release_please_workflow = (
     root / ".github/workflows/release-please.yml"
 ).read_text()
-assert "secrets.TAP_TOKEN" in release_please_workflow
+assert "actions/create-github-app-token@" in release_please_workflow
+assert "vars.RELEASE_PLEASE_CLIENT_ID" in release_please_workflow
+assert "secrets.RELEASE_PLEASE_APP_PRIVATE_KEY" in release_please_workflow
+assert "permission-actions: write" in release_please_workflow
+assert "gh workflow run release.yml" in release_please_workflow
+assert "secrets.TAP_TOKEN" not in release_please_workflow
 assert "--auto" not in release_please_workflow
 assert "pull_request_target" not in release_please_workflow
 
 release_workflow = (root / ".github/workflows/release.yml").read_text()
-assert 'gh release upload "$GITHUB_REF_NAME"' in release_workflow
-assert 'gh release edit "$GITHUB_REF_NAME"' in release_workflow
+assert "workflow_dispatch:" in release_workflow
+assert "push:\n    tags:" not in release_workflow
+assert 'gh release upload "$RELEASE_TAG"' in release_workflow
+assert 'gh release edit "$RELEASE_TAG"' in release_workflow
 assert "--draft=false" in release_workflow
-assert "Require website release automation token" in release_workflow
-assert "secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN" in release_workflow
+assert "anchore/sbom-action/download-syft@" in release_workflow
+assert "sigstore/cosign-installer@" in release_workflow
+assert "cosign sign-blob" in release_workflow
+assert "cosign verify-blob" in release_workflow
+assert "actions/attest-build-provenance@" in release_workflow
+assert "gh attestation verify" in release_workflow
+assert "--prerelease" in release_workflow
+assert "Promote prerelease to stable and latest" in release_workflow
+assert "--clobber" not in release_workflow
+assert "secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN" not in release_workflow
+assert "secrets.RELEASE_PLEASE_APP_PRIVATE_KEY" in release_workflow
 assert "repos/SnapDogRocks/snapdog-web/dispatches" in release_workflow
 assert "event_type=snapdog-os-installer-release" in release_workflow
-assert 'client_payload[tag]=$GITHUB_REF_NAME' in release_workflow
-assert release_workflow.index("Require website release automation token") < (
-    release_workflow.index("      - name: Publish GitHub release")
-)
-assert release_workflow.index("      - name: Publish GitHub release") < (
-    release_workflow.index("      - name: Update SnapDog website release links")
+assert 'client_payload[tag]=$RELEASE_TAG' in release_workflow
+assert release_workflow.index("Promote prerelease to stable and latest") < (
+    release_workflow.index("Dispatch website update and wait for its workflow")
 )
 assert "RUST_VERSION" not in release_workflow
-assert release_workflow.count("environment: release") == 2
+assert release_workflow.count("environment: release") >= 3
 
 ci_workflow = (root / ".github/workflows/ci.yml").read_text()
 assert "RUST_VERSION" not in ci_workflow
+assert "CI Success" in ci_workflow
+assert "ubuntu-24.04-arm" in ci_workflow
+assert "windows-2025" in ci_workflow
+assert "cargo llvm-cov nextest" in ci_workflow
+assert "gitleaks/gitleaks-action@" in ci_workflow
+assert "macos-" not in ci_workflow
+
+for workflow in (root / ".github/workflows").glob("*.yml"):
+    for action in re.findall(r"uses:\s+[^\s@]+@([^\s#]+)", workflow.read_text()):
+        assert re.fullmatch(r"[0-9a-f]{40}", action), (
+            f"{workflow}: action is not pinned to a full commit: {action}"
+        )
+
+release_assets = root / "scripts/release-assets.sh"
+assert release_assets.stat().st_mode & 0o111
+for suffix in (".AppImage", ".exe", ".dmg", ".spdx.json", ".sigstore.json"):
+    assert suffix in release_assets.read_text()
 
 macos_pipeline = (root / "src/pipeline/macos.rs").read_text()
 runtime_requirement = re.search(

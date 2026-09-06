@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: SnapDog documentation
+    url: https://snapdog.cc
+    about: Check the installation documentation before opening an issue.

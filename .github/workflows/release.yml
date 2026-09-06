@@ -1,14 +1,15 @@
 name: Release
 
 on:
-  push:
-    tags:
-      # GitHub tag filters use glob syntax; the job below enforces the exact
-      # v<Cargo.toml version> contract.
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag, or vX.Y.Z-suffix for a pipeline test
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -18,32 +19,55 @@ env:
 
 jobs:
   validate-tag:
-    name: Validate release tag
+    name: Validate immutable release input
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Match tag to Cargo package version
+          ref: ${{ inputs.tag }}
+      - name: Match tag, ref, commit, and package version
         id: version
-        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo version $version" >&2
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
             exit 1
           fi
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
-            echo "release tag must point to a commit contained in origin/main" >&2
+          version=${BASH_REMATCH[1]}
+          package_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$version" == "$package_version" ]] || {
+            echo "tag core $version does not match Cargo version $package_version" >&2
             exit 1
           }
+          [[ "$GITHUB_REF_NAME" == "$RELEASE_TAG" ]] || {
+            echo "workflow ref $GITHUB_REF_NAME does not match input $RELEASE_TAG" >&2
+            exit 1
+          }
+          [[ "$(git rev-list -n 1 "$RELEASE_TAG")" == "$GITHUB_SHA" ]] || {
+            echo "workflow commit does not match tag target" >&2
+            exit 1
+          }
+          if [[ "$RELEASE_TAG" == "v$version" ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "production release tag must point to a commit contained in main" >&2
+              exit 1
+            }
+            prerelease=false
+          else
+            prerelease=true
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
       - name: Require installer-ready public image manifests
         run: ./scripts/check-live-manifests.py
 
@@ -55,37 +79,31 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
       - name: Install Linux build dependencies
         run: >-
           sudo apt-get update && sudo apt-get install --yes --no-install-recommends
           appstream desktop-file-utils libasound2-dev libudev-dev libwayland-dev libx11-xcb-dev
           libxkbcommon-dev libxkbcommon-x11-dev libxcursor-dev libxi-dev
           libxrandr-dev pkg-config shellcheck
-      - name: Install Rust
+      - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install --no-self-update
           rustup show active-toolchain
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-quality
-      - name: Cache security tools
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Install pinned Rust tools
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
         with:
-          path: |
-            ~/.cargo/bin/cargo-audit
-            ~/.cargo/bin/cargo-about
-            ~/.cargo/bin/cargo-deny
-          key: security-tools-about-0.9.0-audit-0.22.2-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
-      - name: Install security tools
-        run: |
-          command -v cargo-about >/dev/null || cargo install --locked --version 0.9.0 --features cli cargo-about
-          command -v cargo-audit >/dev/null || cargo install --locked --version 0.22.2 cargo-audit
-          command -v cargo-deny >/dev/null || cargo install --locked --version 0.20.2 cargo-deny
+          tool: cargo-about,cargo-deny,cargo-nextest
       - name: Install pinned actionlint
         run: |
+          set -euo pipefail
           install_dir="$RUNNER_TEMP/actionlint"
           mkdir -p "$install_dir"
           curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
@@ -94,7 +112,7 @@ jobs:
           echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --status
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$install_dir" actionlint
           echo "$install_dir" >> "$GITHUB_PATH"
-      - name: Run strict release quality gate
+      - name: Run strict release checks
         run: ./scripts/check.sh
 
   linux:
@@ -119,8 +137,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
       - name: Build and test in pinned GLIBC 2.28 container
         run: ./scripts/package-linux.sh --container "${{ matrix.target }}"
       - name: Smoke-test AppImage in clean Ubuntu 22.04
@@ -135,7 +155,7 @@ jobs:
                 binutils ca-certificates libegl1 libgl1-mesa-dri xauth xvfb >/dev/null
               ./packaging/linux/smoke-test-appimage.sh dist/*.AppImage
             '
-      - name: Upload release artifact
+      - name: Upload release payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-linux-${{ matrix.arch }}
@@ -163,16 +183,18 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install Rust target
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install pinned Rust target
         shell: pwsh
         run: |
           rustup toolchain install --no-self-update
-          rustup show active-toolchain
           rustup target add '${{ matrix.target }}'
+          rustup show active-toolchain
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
       - name: Run strict target checks and package executable
@@ -187,7 +209,7 @@ jobs:
           cargo check --locked --target '${{ matrix.target }}' --all-targets --all-features
           if ('${{ matrix.arch }}' -eq 'x86_64') { cargo test --locked --all-features }
           ./scripts/package-windows.ps1 -Target '${{ matrix.target }}'
-      - name: Upload unsigned executable for signing
+      - name: Upload unsigned executable for optional signing
         if: vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -195,7 +217,7 @@ jobs:
           path: dist/*.exe
           if-no-files-found: error
           retention-days: 1
-      - name: Upload unsigned release artifact
+      - name: Upload unsigned release payload
         if: vars.AZURE_TRUSTED_SIGNING_ENABLED != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -250,7 +272,7 @@ jobs:
           if ($files.Count -ne 1) { throw "Expected one executable, found $($files.Count)." }
           $signature = Get-AuthenticodeSignature -LiteralPath $files[0].FullName
           if ($signature.Status -ne 'Valid') { throw "Invalid signature: $($signature.Status)" }
-      - name: Upload signed release artifact
+      - name: Upload signed release payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-windows-${{ matrix.arch }}
@@ -267,14 +289,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install Rust
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install --no-self-update
           rustup show active-toolchain
       - name: Cache Rust build data
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-macos-universal
       - name: Install pinned DMG tooling
@@ -295,13 +319,13 @@ jobs:
           cargo test --locked --all-features
       - name: Build, sign, notarize, and staple DMG
         env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_CERT_P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ vars.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
         run: ./scripts/package-macos.sh
-      - name: Upload release artifact
+      - name: Upload release payload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-macos
@@ -309,8 +333,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
-    name: Publish GitHub release
+  candidate:
+    name: Build signed release candidate
     needs: [validate-tag, quality, linux, windows, windows-sign, macos]
     if: >-
       ${{ always() &&
@@ -321,113 +345,319 @@ jobs:
           needs.macos.result == 'success' &&
           (needs.windows-sign.result == 'success' || needs.windows-sign.result == 'skipped') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
-    env:
-      WINDOWS_SIGNED: ${{ vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true' }}
     steps:
-      - name: Require website release automation token
-        shell: bash
-        env:
-          WEBSITE_AUTOMATION_TOKEN: ${{ secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${WEBSITE_AUTOMATION_TOKEN:-}" ]]; then
-            echo "SNAPDOG_RELEASE_AUTOMATION_TOKEN must be configured before publishing a release" >&2
-            exit 1
-          fi
-      - name: Download release artifacts
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download release payloads
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Verify release asset set
-        shell: bash
+      - name: Verify payload set
+        run: ./scripts/release-assets.sh verify release-assets '${{ needs.validate-tag.outputs.version }}' payloads
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - name: Generate one SPDX SBOM per payload
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
         run: |
           set -euo pipefail
-          version='${{ needs.validate-tag.outputs.version }}'
-          expected=(
-            "snapdog-os-installer-$version-linux-x86_64.AppImage"
-            "snapdog-os-installer-$version-linux-aarch64.AppImage"
-            "snapdog-os-installer-$version-windows-x86_64.exe"
-            "snapdog-os-installer-$version-windows-aarch64.exe"
-            "snapdog-os-installer-$version-macos-universal.dmg"
+          while IFS= read -r asset; do
+            "$SYFT" scan "file:release-assets/$asset" \
+              --output "spdx-json=release-assets/$asset.spdx.json"
+          done < <(./scripts/release-assets.sh list-payloads "$VERSION")
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign every payload with keyless Sigstore
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r asset; do
+            cosign sign-blob --yes \
+              --bundle "release-assets/$asset.sigstore.json" \
+              "release-assets/$asset"
+          done < <(./scripts/release-assets.sh list-payloads "$VERSION")
+      - name: Generate final checksums and verify candidate
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t checksum_files < <(
+            find release-assets -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS \
+              -printf '%f\n' | LC_ALL=C sort
           )
-          for asset in "${expected[@]}"; do
-            test -s "release-assets/$asset" || {
-              echo "missing or empty release asset: $asset" >&2
-              exit 1
-            }
-          done
-          if [[ $(find release-assets -maxdepth 1 -type f | wc -l) -ne ${#expected[@]} ]]; then
-            echo "unexpected files in release asset set" >&2
-            find release-assets -maxdepth 1 -type f -print >&2
-            exit 1
-          fi
-      - name: Generate SHA-256 checksums
-        working-directory: release-assets
-        run: sha256sum -- * > SHA256SUMS
-      - name: Attest release artifacts
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+          (cd release-assets && sha256sum -- "${checksum_files[@]}") \
+            > release-assets/SHA256SUMS
+          ./scripts/release-assets.sh verify release-assets "$VERSION" complete
+      - name: Attest complete candidate
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release-assets/*
-      - name: Generate release notes with signing status
+      - name: Upload immutable release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  stage:
+    name: Stage and verify public prerelease
+    needs: [validate-tag, candidate]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download immutable candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-candidate
+          path: candidate
+      - name: Verify candidate before publication
+        run: ./scripts/release-assets.sh verify candidate '${{ needs.validate-tag.outputs.version }}' complete
+      - name: Generate release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          WINDOWS_SIGNED: ${{ vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true' }}
         run: |
+          set -euo pipefail
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-            -f tag_name="$GITHUB_REF_NAME" \
+            -f tag_name="$RELEASE_TAG" \
             -f target_commitish="$GITHUB_SHA" \
             --jq .body > "$RUNNER_TEMP/generated-notes.md"
           {
-            if [[ "$WINDOWS_SIGNED" == "true" ]]; then
-              echo "> [!NOTE]"
-              echo "> The Windows executables in this release are signed with Azure Artifact Signing."
+            if [[ "$WINDOWS_SIGNED" == true ]]; then
+              echo '> [!NOTE]'
+              echo '> The Windows executables are Authenticode-signed with Azure Artifact Signing.'
             else
-              echo "> [!WARNING]"
-              echo "> **The Windows executables in this release are unsigned.** Verify \`SHA256SUMS\` before running them. Azure Artifact Signing is prepared but not enabled for this release."
+              echo '> [!WARNING]'
+              echo '> **The Windows executables are not Authenticode-signed.** Verify SHA256SUMS, the Sigstore bundle, or the GitHub attestation before running them.'
             fi
+            echo
+            echo 'Every installer payload includes an SPDX SBOM and a keyless Sigstore bundle. GitHub build provenance attestations cover every published file.'
             echo
             cat "$RUNNER_TEMP/generated-notes.md"
           } > "$RUNNER_TEMP/release-notes.md"
-      - name: Publish GitHub release
+      - name: Publish candidate as prerelease without replacing bytes
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          IS_PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
         run: |
           set -euo pipefail
-          title="SnapDog OS Installer ${{ needs.validate-tag.outputs.version }}"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # Release Please creates a draft release and force-creates its tag so
-            # this packaging workflow can run. Keep it private until every asset
-            # and attestation has passed, then publish it as the final operation.
-            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null || true)
+          if [[ -z "$release_json" ]]; then
+            [[ "$IS_PRERELEASE" == true ]] || {
+              echo "Release Please did not create the required production draft release." >&2
+              exit 1
+            }
+            gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --clobber
-            gh release edit "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft=false \
-              --notes-file "$RUNNER_TEMP/release-notes.md" \
-              --title "$title" \
-              --verify-tag
-          else
-            # Preserve the documented manual-tag recovery path.
-            gh release create "$GITHUB_REF_NAME" release-assets/* \
-              --repo "$GITHUB_REPOSITORY" \
+              --draft \
               --verify-tag \
-              --notes-file "$RUNNER_TEMP/release-notes.md" \
-              --title "$title"
+              --title "SnapDog OS Installer $RELEASE_TAG"
+            release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
           fi
-      - name: Update SnapDog website release links
-        shell: bash
+          draft=$(jq -r .draft <<<"$release_json")
+          prerelease=$(jq -r .prerelease <<<"$release_json")
+          if [[ "$draft" == true ]]; then
+            asset_count=$(jq '.assets | length' <<<"$release_json")
+            [[ "$asset_count" == 0 ]] || {
+              echo "Draft release already contains assets; refusing to clobber them." >&2
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" candidate/* --repo "$GITHUB_REPOSITORY"
+          elif [[ "$prerelease" != true ]]; then
+            echo "Release is already stable; refusing to replace published bytes." >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease \
+            --latest=false \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --title "SnapDog OS Installer $RELEASE_TAG" \
+            --verify-tag
+      - name: Download public bytes
         env:
-          GH_TOKEN: ${{ secrets.SNAPDOG_RELEASE_AUTOMATION_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            public_dir="$RUNNER_TEMP/public-release-$attempt"
+            mkdir -p "$public_dir"
+            if gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$public_dir"; then
+              echo "PUBLIC_DIR=$public_dir" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Could not download the staged public release.' >&2
+          exit 1
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify public bytes, signatures, checksums, and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/release-assets.sh verify "$PUBLIC_DIR" "$VERSION" complete
+          while IFS= read -r asset; do
+            cmp "candidate/$asset" "$PUBLIC_DIR/$asset"
+            cmp "candidate/$asset.spdx.json" "$PUBLIC_DIR/$asset.spdx.json"
+            cmp "candidate/$asset.sigstore.json" "$PUBLIC_DIR/$asset.sigstore.json"
+            cosign verify-blob \
+              --bundle "$PUBLIC_DIR/$asset.sigstore.json" \
+              --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$RELEASE_TAG" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$PUBLIC_DIR/$asset"
+          done < <(./scripts/release-assets.sh list-payloads "$VERSION")
+          cmp candidate/SHA256SUMS "$PUBLIC_DIR/SHA256SUMS"
+          for file in "$PUBLIC_DIR"/*; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq 'select(.draft == false and .prerelease == true) | .tag_name' | grep -Fx "$RELEASE_TAG"
+
+  promote:
+    name: Promote verified candidate unchanged
+    if: needs.validate-tag.outputs.prerelease == 'false'
+    needs: [validate-tag, stage]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download staged public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir public-release
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Reverify public candidate before promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/release-assets.sh verify public-release "$VERSION" complete
+          while IFS= read -r asset; do
+            cosign verify-blob \
+              --bundle "public-release/$asset.sigstore.json" \
+              --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$RELEASE_TAG" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "public-release/$asset"
+          done < <(./scripts/release-assets.sh list-payloads "$VERSION")
+          for file in public-release/*; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Promote prerelease to stable and latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease=false \
+            --latest \
+            --verify-tag
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq 'select(.draft == false and .prerelease == false) | .tag_name' | grep -Fx "$RELEASE_TAG"
+
+  notify-website:
+    name: Update and verify SnapDog website
+    needs: [validate-tag, promote]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - name: Mint short-lived website automation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: SnapDogRocks
+          repositories: snapdog-web
+          permission-actions: read
+          permission-contents: write
+      - name: Dispatch website update and wait for its workflow
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          dispatched_at=$(date -u +%s)
           gh api --method POST \
             repos/SnapDogRocks/snapdog-web/dispatches \
             -f event_type=snapdog-os-installer-release \
-            -F "client_payload[tag]=$GITHUB_REF_NAME"
+            -F "client_payload[tag]=$RELEASE_TAG" \
+            -F "client_payload[source_run_id]=$GITHUB_RUN_ID"
+          run_id=
+          for _ in {1..30}; do
+            run_id=$(gh run list \
+              --repo SnapDogRocks/snapdog-web \
+              --workflow update-installer-release.yml \
+              --event repository_dispatch \
+              --limit 10 \
+              --json databaseId,createdAt \
+              --jq ".[] | select((.createdAt | fromdateiso8601) >= $dispatched_at) | .databaseId" | head -1)
+            [[ -n "$run_id" ]] && break
+            sleep 5
+          done
+          [[ -n "$run_id" ]] || {
+            echo 'Website update workflow did not start.' >&2
+            exit 1
+          }
+          gh run watch "$run_id" --repo SnapDogRocks/snapdog-web --exit-status
+      - name: Verify updated metadata on main
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          for _ in {1..30}; do
+            tag=$(gh api \
+              repos/SnapDogRocks/snapdog-web/contents/src/data/snapdog-os-installer-release.json \
+              -H 'Accept: application/vnd.github.raw+json' \
+              --jq .tag 2>/dev/null || true)
+            [[ "$tag" == "$RELEASE_TAG" ]] && exit 0
+            sleep 10
+          done
+          echo "snapdog-web main does not reference $RELEASE_TAG" >&2
+          exit 1

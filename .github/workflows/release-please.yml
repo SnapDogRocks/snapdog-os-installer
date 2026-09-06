@@ -11,6 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -18,15 +19,39 @@ jobs:
   release-please:
     name: Prepare or tag release
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 10
     steps:
-      - name: Require release automation token
-        env:
-          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-        run: test -n "$TAP_TOKEN"
+      - name: Mint short-lived release automation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_PLEASE_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: SnapDogRocks
+          repositories: snapdog-os-installer
+          permission-actions: write
+          permission-contents: write
+          permission-pull-requests: write
       - name: Maintain release pull request and draft release
+        id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
-          token: ${{ secrets.TAP_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Dispatch immutable release pipeline
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release Please returned an invalid production tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$RELEASE_TAG" \
+            -f "tag=$RELEASE_TAG"

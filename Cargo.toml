@@ -2,7 +2,6 @@
 name = "snapdog-os-installer"
 version = "0.2.3"
 edition = "2024"
-rust-version = "1.97"
 license = "GPL-3.0-only"
 repository = "https://github.com/SnapDogRocks/snapdog-os-installer"
 homepage = "https://snapdog.cc"
@@ -86,6 +85,7 @@ codegen-units = 16
 wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [lints.rust]
+# Native framework FFI is allowed only on the two audited wrapper modules in src/lib.rs.
 unsafe_code = "deny"
 
 [lints.clippy]

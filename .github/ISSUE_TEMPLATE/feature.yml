@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a focused improvement
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and platform impact
+      description: Describe any effect on device selection, authorization, writing, or verification.
