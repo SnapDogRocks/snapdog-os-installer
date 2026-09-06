@@ -472,7 +472,12 @@ jobs:
           IS_PRERELEASE: ${{ needs.validate-tag.outputs.prerelease }}
         run: |
           set -euo pipefail
-          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null || true)
+          find_release() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -s --arg tag "$RELEASE_TAG" \
+                'add | map(select(.tag_name == $tag)) | first // empty'
+          }
+          release_json=$(find_release)
           if [[ -z "$release_json" ]]; then
             [[ "$IS_PRERELEASE" == true ]] || {
               echo "Release Please did not create the required production draft release." >&2
@@ -483,7 +488,11 @@ jobs:
               --draft \
               --verify-tag \
               --title "SnapDog OS Installer $RELEASE_TAG"
-            release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+            release_json=$(find_release)
+            [[ -n "$release_json" ]] || {
+              echo "Draft release was created but cannot be read back." >&2
+              exit 1
+            }
           fi
           draft=$(jq -r .draft <<<"$release_json")
           prerelease=$(jq -r .prerelease <<<"$release_json")
