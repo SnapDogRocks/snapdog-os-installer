@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.4](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.3...v0.2.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* detect missing draft releases safely ([#28](https://github.com/SnapDogRocks/snapdog-os-installer/issues/28)) ([52dc356](https://github.com/SnapDogRocks/snapdog-os-installer/commit/52dc3566dd6c4ee367836ce3d8f38da9f2ed3a0c))
+* require verified release staging ([#26](https://github.com/SnapDogRocks/snapdog-os-installer/issues/26)) ([7c1246d](https://github.com/SnapDogRocks/snapdog-os-installer/commit/7c1246d1c9f250bb19a8513c90c3cbafdc381bb8))
+* retry draft release readback ([#29](https://github.com/SnapDogRocks/snapdog-os-installer/issues/29)) ([187de34](https://github.com/SnapDogRocks/snapdog-os-installer/commit/187de34872ea8388f937e48d71c6340e9d44134c))
+
 ## [0.2.3](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.2...v0.2.3) (2026-07-22)
 
 
