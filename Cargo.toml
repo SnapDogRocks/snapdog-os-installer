@@ -11,7 +11,7 @@ build = "build.rs"
 
 [dependencies]
 eframe = { version = "=0.33.3", default-features = false, features = ["accesskit", "default_fonts", "wayland", "wgpu", "x11"] }
-egui_extras = { version = "=0.33.3", default-features = false, features = ["image", "svg"] }
+egui_extras = { version = "=0.36.1", default-features = false, features = ["image", "svg"] }
 flate2 = "1"
 hex = "0.4"
 image = { version = "=0.25.9", default-features = false, features = ["png"] }
