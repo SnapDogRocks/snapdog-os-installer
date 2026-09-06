@@ -20,9 +20,11 @@ Each tagged release is built as one Rust executable per platform package:
 - Windows: standalone `arm64` and `x86_64` executables
 - Linux: standalone `arm64` and `x86_64` AppImages
 
-Release assets include SHA-256 checksums and GitHub build-provenance attestations. Windows release
-signing is ready for Azure Artifact Signing and can be enabled once the SnapDog signing account is
-provisioned; until then the Windows executables are clearly published unsigned.
+Every installer payload includes an SPDX SBOM, a keyless Sigstore bundle, a final SHA-256 checksum,
+and GitHub build-provenance attestation. Windows release signing is ready for Azure Artifact Signing
+and can be enabled once the SnapDog signing account is provisioned; until then the Windows
+executables are clearly published without Authenticode signatures and remain verifiable through
+the other three mechanisms.
 The GPL license and generated third-party notices are embedded in every package and available from
 the application's Settings screen; the Windows executables retain the one-file distribution model.
 
@@ -58,7 +60,7 @@ release checklist.
 
 ## Development
 
-Rust 1.97 is required. The repository pins the exact supported compiler and components in
+Rust 1.98.1 is required. The repository pins the exact supported compiler and components in
 `rust-toolchain.toml`, which `rustup` selects automatically.
 
 ```bash
@@ -85,9 +87,11 @@ packages must be built from an MSVC developer shell.
 
 Release Please maintains the package version, `Cargo.lock`, and `CHANGELOG.md` in a release pull
 request. The release PR is deliberately never auto-merged. Merging it creates a matching `vX.Y.Z`
-tag and a private draft release; the tag builds all five packages, signs and notarizes macOS,
-optionally signs Windows through GitHub OIDC, checks the complete asset set, creates checksums and
-attestations, and publishes the release only after every gate succeeds. See
+tag and private draft release, then dispatches the release workflow with a short-lived GitHub App
+token. The workflow builds all five packages, signs and notarizes macOS, optionally signs Windows
+through GitHub OIDC, creates and verifies SBOMs, Sigstore bundles, checksums, and attestations, and
+first publishes a prerelease. Only the publicly downloaded bytes are promoted unchanged to stable
+and latest; the website update runs and is verified afterward. See
 [Release configuration](docs/releasing.md).
 
 ## License
