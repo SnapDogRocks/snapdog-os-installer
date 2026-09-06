@@ -31,7 +31,7 @@ objc2-disk-arbitration = { version = "=0.3.2", default-features = false, feature
 objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc"] }
 objc2-security = { version = "=0.3.2", default-features = false, features = ["std", "CSCommon", "SecBase", "SecRequirement", "SecStaticCode"] }
 unix-ancillary = "0.2.2"
-wgpu = { version = "=27.0.1", default-features = false, features = ["metal"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 aligned-vec = "=0.6.4"
