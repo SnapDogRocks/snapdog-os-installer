@@ -98,7 +98,7 @@ jobs:
         with:
           key: release-quality
       - name: Install pinned Rust tools
-        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2.87.6
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-about@0.9.2,cargo-deny@0.20.2,cargo-nextest@0.9.143
       - name: Install pinned actionlint
@@ -156,7 +156,7 @@ jobs:
               ./packaging/linux/smoke-test-appimage.sh dist/*.AppImage
             '
       - name: Upload release payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux-${{ matrix.arch }}
           path: dist/*.AppImage
@@ -211,7 +211,7 @@ jobs:
           ./scripts/package-windows.ps1 -Target '${{ matrix.target }}'
       - name: Upload unsigned executable for optional signing
         if: vars.AZURE_TRUSTED_SIGNING_ENABLED == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unsigned-windows-${{ matrix.arch }}
           path: dist/*.exe
@@ -219,7 +219,7 @@ jobs:
           retention-days: 1
       - name: Upload unsigned release payload
         if: vars.AZURE_TRUSTED_SIGNING_ENABLED != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows-${{ matrix.arch }}
           path: dist/*.exe
@@ -242,12 +242,12 @@ jobs:
         arch: [x86_64, aarch64]
     steps:
       - name: Download unsigned executable
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: unsigned-windows-${{ matrix.arch }}
           path: ${{ runner.temp }}/windows
       - name: Sign in to Azure with OIDC
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -273,7 +273,7 @@ jobs:
           $signature = Get-AuthenticodeSignature -LiteralPath $files[0].FullName
           if ($signature.Status -ne 'Valid') { throw "Invalid signature: $($signature.Status)" }
       - name: Upload signed release payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows-${{ matrix.arch }}
           path: ${{ runner.temp }}/windows/*.exe
@@ -326,7 +326,7 @@ jobs:
           APPLE_API_ISSUER: ${{ vars.APPLE_API_ISSUER }}
         run: ./scripts/package-macos.sh
       - name: Upload release payload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-macos
           path: dist/*-macos-universal.dmg
@@ -356,7 +356,7 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
       - name: Download release payloads
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: release-assets
@@ -365,7 +365,7 @@ jobs:
         run: ./scripts/release-assets.sh verify release-assets '${{ needs.validate-tag.outputs.version }}' payloads
       - name: Install pinned Syft
         id: syft
-        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           syft-version: v1.51.1
       - name: Generate one SPDX SBOM per payload
@@ -409,7 +409,7 @@ jobs:
         with:
           subject-path: release-assets/*
       - name: Upload immutable release candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-candidate
           path: release-assets/*
@@ -435,7 +435,7 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
       - name: Download immutable candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-candidate
           path: candidate
@@ -636,7 +636,7 @@ jobs:
     steps:
       - name: Mint short-lived website automation token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.RELEASE_PLEASE_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
