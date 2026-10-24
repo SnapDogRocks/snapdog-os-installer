@@ -18,6 +18,9 @@ all-features = true
 ignore = [
   { id = "RUSTSEC-2024-0436", reason = "wgpu 27 pulls paste through metal; no safe compatible upgrade is available" },
   { id = "RUSTSEC-2026-0192", reason = "egui 0.33 pulls ttf-parser through ab_glyph; no safe compatible upgrade is available" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained (merged into zbus 6). zbus 5 is still required: accesskit_unix (eframe's Linux accessibility) depends on it, and zbus 6 drops the blocking API the Linux worker uses; drop once accesskit_unix moves to zbus 6 and the worker is ported" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained (merged into zbus 6). zbus 5 is still required: accesskit_unix (eframe's Linux accessibility) depends on it, and zbus 6 drops the blocking API the Linux worker uses; drop once accesskit_unix moves to zbus 6 and the worker is ported" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained (merged into zbus 6). zbus 5 is still required: accesskit_unix (eframe's Linux accessibility) depends on it, and zbus 6 drops the blocking API the Linux worker uses; drop once accesskit_unix moves to zbus 6 and the worker is ported" },
 ]
 
 [licenses]
