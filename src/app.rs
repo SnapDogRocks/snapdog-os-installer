@@ -2575,7 +2575,7 @@ mod tests {
             .iter()
             .find(|license| license.title.contains("GPL-3.0-only"))
             .expect("the application GPL entry remains visible");
-        assert!(!gpl.notices.is_empty());
+        assert_ne!(gpl.notices.len(), 0);
         assert!(
             gpl.notices
                 .iter()
