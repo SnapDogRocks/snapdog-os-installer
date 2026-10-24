@@ -14,12 +14,12 @@ eframe = { version = "=0.33.3", default-features = false, features = ["accesskit
 egui_extras = { version = "=0.33.3", default-features = false, features = ["image", "svg"] }
 flate2 = "1"
 hex = "0.4"
-image = { version = "=0.25.9", default-features = false, features = ["png"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls"] }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tempfile = "3"
 tracing = "0.1"
@@ -30,7 +30,7 @@ objc2-core-foundation = { version = "=0.3.2", default-features = false, features
 objc2-disk-arbitration = { version = "=0.3.2", default-features = false, features = ["std", "DADisk", "DADissenter", "DASession", "libc"] }
 objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc"] }
 objc2-security = { version = "=0.3.2", default-features = false, features = ["std", "CSCommon", "SecBase", "SecRequirement", "SecStaticCode"] }
-unix-ancillary = "0.2.2"
+unix-ancillary = "0.6.1"
 wgpu = { version = "=27.0.1", default-features = false, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -54,7 +54,7 @@ wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aligned-vec = "=0.6.4"
-zbus = { version = "=5.18.0", default-features = false, features = ["blocking-api"] }
+zbus = { version = "=5.19.0", default-features = false, features = ["blocking-api"] }
 wgpu = { version = "=27.0.1", default-features = false, features = ["gles", "vulkan"] }
 
 [build-dependencies]
