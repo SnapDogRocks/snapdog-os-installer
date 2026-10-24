@@ -1097,7 +1097,7 @@ impl SnapDogInstallerApp {
                     });
                     let mut response = ui.interact(
                         ui.min_rect(),
-                        ui.id().with("verify-after-writing"),
+                        ui.scope_id().with("verify-after-writing"),
                         egui::Sense::click(),
                     );
                     let keyboard_activation = response.has_focus()
@@ -1225,7 +1225,8 @@ impl SnapDogInstallerApp {
 }
 
 impl eframe::App for SnapDogInstallerApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = &root.ctx().clone();
         self.receive_catalog();
         self.receive_operation(context);
 
@@ -1246,7 +1247,7 @@ impl eframe::App for SnapDogInstallerApp {
                     .fill(BACKGROUND)
                     .inner_margin(egui::Margin::same(24)),
             )
-            .show(context, |ui| {
+            .show(root, |ui| {
                 let setup = matches!(self.operation, OperationState::Idle);
                 if setup {
                     self.setup_top_bar(ui);
@@ -1987,7 +1988,7 @@ fn required_size(value: Option<u64>, name: &str) -> Result<u64, String> {
 }
 
 fn configure_style(context: &egui::Context) {
-    let mut style = (*context.style()).clone();
+    let mut style = (*context.global_style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = BACKGROUND;
     style.visuals.window_fill = SURFACE;
@@ -1996,7 +1997,7 @@ fn configure_style(context: &egui::Context) {
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(240, 154, 63);
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     style.spacing.button_padding = Vec2::new(12.0, 7.0);
-    context.set_style(style);
+    context.set_global_style(style);
 }
 
 fn step_title(ui: &mut egui::Ui, title: &str, active: bool) {
@@ -2255,7 +2256,7 @@ fn branded_modal<T>(
     id: &str,
     body: impl FnOnce(&mut egui::Ui) -> T,
 ) -> egui::ModalResponse<T> {
-    egui::Modal::new(egui::Id::new(id))
+    egui::Modal::new(egui::Id::unique(id))
         .backdrop_color(Color32::from_black_alpha(170))
         .frame(
             egui::Frame::new()
@@ -2575,7 +2576,7 @@ mod tests {
             .iter()
             .find(|license| license.title.contains("GPL-3.0-only"))
             .expect("the application GPL entry remains visible");
-        assert!(!gpl.notices.is_empty());
+        assert_ne!(gpl.notices.len(), 0);
         assert!(
             gpl.notices
                 .iter()
