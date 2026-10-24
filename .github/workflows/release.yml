@@ -190,6 +190,8 @@ jobs:
       - name: Install pinned Rust target
         shell: pwsh
         run: |
+          # Fail the step when a native command (cargo, rustup) exits non-zero.
+          $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install --no-self-update
           rustup target add '${{ matrix.target }}'
           rustup show active-toolchain
@@ -200,6 +202,8 @@ jobs:
       - name: Run strict target checks and package executable
         shell: pwsh
         run: |
+          # Fail the step when a native command (cargo, rustup) exits non-zero.
+          $PSNativeCommandUseErrorActionPreference = $true
           $env:RUSTFLAGS = '-Dwarnings -C target-feature=+crt-static'
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires '${{ matrix.vs_component }}' -property installationPath
@@ -268,6 +272,8 @@ jobs:
       - name: Verify Authenticode signature
         shell: pwsh
         run: |
+          # Fail the step when a native command (cargo, rustup) exits non-zero.
+          $PSNativeCommandUseErrorActionPreference = $true
           $files = Get-ChildItem -LiteralPath '${{ runner.temp }}\windows' -Filter '*.exe'
           if ($files.Count -ne 1) { throw "Expected one executable, found $($files.Count)." }
           $signature = Get-AuthenticodeSignature -LiteralPath $files[0].FullName

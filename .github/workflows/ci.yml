@@ -150,6 +150,8 @@ jobs:
       - name: Install pinned Rust target
         shell: pwsh
         run: |
+          # Fail the step when a native command (cargo, rustup) exits non-zero.
+          $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install --no-self-update
           rustup target add '${{ matrix.target }}'
           rustup show active-toolchain
@@ -160,6 +162,8 @@ jobs:
       - name: Run strict target checks
         shell: pwsh
         run: |
+          # Fail the step when a native command (cargo, rustup) exits non-zero.
+          $PSNativeCommandUseErrorActionPreference = $true
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires '${{ matrix.vs_component }}' -property installationPath
           if ([string]::IsNullOrWhiteSpace($vs)) { throw 'Visual Studio C++ toolchain was not found.' }
