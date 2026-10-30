@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.5](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.4...v0.2.5) (2026-10-30)
+
+
+### Bug Fixes
+
+* **deps:** move to egui 0.37 and wgpu 30 ([14392cf](https://github.com/SnapDogRocks/snapdog-os-installer/commit/14392cfd2a3b48835f38f79d7df2f1a67511a42c))
+* **deps:** update rustls, tokio, sha2, unix-ancillary and the minor/patch group ([14392cf](https://github.com/SnapDogRocks/snapdog-os-installer/commit/14392cfd2a3b48835f38f79d7df2f1a67511a42c))
+
 ## [0.2.4](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.3...v0.2.4) (2026-09-06)
 
 
