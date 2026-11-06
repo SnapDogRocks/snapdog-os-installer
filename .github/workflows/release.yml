@@ -576,7 +576,11 @@ jobs:
 
   promote:
     name: Promote verified candidate unchanged
-    if: needs.validate-tag.outputs.prerelease == 'false'
+    if: >-
+      ${{ always() &&
+          needs.validate-tag.result == 'success' &&
+          needs.stage.result == 'success' &&
+          needs.validate-tag.outputs.prerelease == 'false' }}
     needs: [validate-tag, stage]
     runs-on: ubuntu-24.04
     environment: release
@@ -634,6 +638,10 @@ jobs:
   notify-website:
     name: Update and verify SnapDog website
     needs: [validate-tag, promote]
+    if: >-
+      ${{ always() &&
+          needs.validate-tag.result == 'success' &&
+          needs.promote.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 30
