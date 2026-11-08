@@ -101,17 +101,12 @@ jobs:
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-about@0.9.2,cargo-deny@0.20.2,cargo-nextest@0.9.143
+      # Checksum-verified release, built from the Go module proxy when GitHub does not deliver it.
       - name: Install pinned actionlint
         run: |
           set -euo pipefail
-          install_dir="$RUNNER_TEMP/actionlint"
-          mkdir -p "$install_dir"
-          curl --proto '=https' --tlsv1.2 --location --fail --silent --show-error \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
-            --output "$RUNNER_TEMP/actionlint.tar.gz"
-          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --status
-          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$install_dir" actionlint
-          echo "$install_dir" >> "$GITHUB_PATH"
+          bash scripts/ci/install-actionlint.sh "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
       - name: Run strict release checks
         run: ./scripts/check.sh
 
