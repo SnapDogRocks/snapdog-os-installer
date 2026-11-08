@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.5...v0.2.6) (2026-11-08)
+
+
+### Bug Fixes
+
+* **release:** promote when the Windows signing job is skipped ([#41](https://github.com/SnapDogRocks/snapdog-os-installer/issues/41)) ([cf3f501](https://github.com/SnapDogRocks/snapdog-os-installer/commit/cf3f50170901020889ea32d01215c940ec7b9d73))
+
 ## [0.2.5](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.4...v0.2.5) (2026-10-30)
 
 
