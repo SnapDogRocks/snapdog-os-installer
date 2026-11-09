@@ -4094,9 +4094,9 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unix-ancillary"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b8acd22a6c7aa27eb5b947514b22601274a86d56fe671ec1e15960e536d6d6d"
+checksum = "1153be2aa32a20e1586dabc234ac2e5271349bdf0f24093ee2e4ed0310829e48"
 dependencies = [
  "libc",
 ]
