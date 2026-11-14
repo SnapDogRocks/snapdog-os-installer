@@ -10008,7 +10008,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Used by:
-- unix-ancillary 0.6.1
+- unix-ancillary 0.6.2
 
 MIT License
 
