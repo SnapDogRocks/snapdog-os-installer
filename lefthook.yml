@@ -19,6 +19,9 @@ pre-push:
   commands:
     secrets:
       run: sh scripts/hooks/check-push-secrets.sh
+    notices:
+      glob: "{Cargo.lock,Cargo.toml,about.hbs,about.toml,THIRD_PARTY_NOTICES.txt}"
+      run: sh scripts/hooks/check-notices.sh
     clippy:
       run: cargo clippy --all-targets -- -D warnings
     tests:

@@ -9,13 +9,7 @@ cargo nextest run --locked --all-features
 cargo check --locked --all-targets
 cargo deny check
 
-NOTICES=$(mktemp)
-trap 'rm -f "$NOTICES"' EXIT
-./scripts/generate-notices.sh "$NOTICES"
-if ! cmp -s THIRD_PARTY_NOTICES.txt "$NOTICES"; then
-  echo "THIRD_PARTY_NOTICES.txt is stale; run ./scripts/generate-notices.sh" >&2
-  exit 1
-fi
+./scripts/hooks/check-notices.sh
 
 shellcheck scripts/*.sh packaging/linux/*.sh
 actionlint
