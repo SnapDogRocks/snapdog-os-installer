@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.6...v0.2.7) (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** update url to 2.5.9 ([#53](https://github.com/SnapDogRocks/snapdog-os-installer/issues/53)) ([ac3054b](https://github.com/SnapDogRocks/snapdog-os-installer/commit/ac3054b98e6c113aca6b39be1f750812cf9cf384))
+
 ## [0.2.6](https://github.com/SnapDogRocks/snapdog-os-installer/compare/v0.2.5...v0.2.6) (2026-11-08)
 
 
