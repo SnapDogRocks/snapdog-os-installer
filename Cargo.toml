@@ -31,7 +31,7 @@ objc2-disk-arbitration = { version = "=0.3.2", default-features = false, feature
 objc2-io-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc"] }
 objc2-security = { version = "=0.3.2", default-features = false, features = ["std", "CSCommon", "SecBase", "SecRequirement", "SecStaticCode"] }
 unix-ancillary = "0.6.1"
-wgpu = { version = "=30.0.1", default-features = false, features = ["metal"] }
+wgpu = { version = "=30.0.2", default-features = false, features = ["metal"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 aligned-vec = "=0.6.4"
@@ -50,12 +50,12 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["dx12"] }
+wgpu = { version = "=30.0.2", default-features = false, features = ["dx12"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aligned-vec = "=0.6.4"
 zbus = { version = "=5.19.0", default-features = false, features = ["blocking-api"] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["gles", "vulkan"] }
+wgpu = { version = "=30.0.2", default-features = false, features = ["gles", "vulkan"] }
 
 [build-dependencies]
 winresource = "0.1"
